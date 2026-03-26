@@ -311,32 +311,34 @@ static uint64_t zns_write(struct zns_ssd *zns, NvmeRequest *req)
 
 static void *ftl_thread(void *arg)
 {
-    FemuCtrl *n = (FemuCtrl *)arg;
-    struct zns_ssd *zns = n->zns;
-    NvmeRequest *req = NULL;
-    uint64_t lat = 0;
-    int rc;
-    int i;
+    FemuCtrl *n = (FemuCtrl *)arg;    // 解析线程入参：FEMU控制结构体
+    struct zns_ssd *zns = n->zns;     // 提取ZNS SSD模拟对象
+    NvmeRequest *req = NULL;          // 存储当前处理的NVMe请求
+    uint64_t lat = 0;                 // 存储请求的IO处理延迟（纳秒/微秒）
+    int rc;                           // 存储函数返回码（校验操作结果）
+    int i;                            // 队列遍历计数器
 
-    while (!*(zns->dataplane_started_ptr)) {
+    while (!*(zns->dataplane_started_ptr)) { //确保FTL线程只在SSD处理IO请求的核心链路完全初始化后才工作
         usleep(100000);
     }
 
     /* FIXME: not safe, to handle ->to_ftl and ->to_poller gracefully */
-    zns->to_ftl = n->to_ftl;
-    zns->to_poller = n->to_poller;
+    zns->to_ftl = n->to_ftl;    // 绑定“待FTL处理”的请求队列数组
+    zns->to_poller = n->to_poller;  // 绑定“待响应主机”的请求队列数组
 
     while (1) {
         for (i = 1; i <= n->nr_pollers; i++) {
+            // 跳过“空队列指针”或“无请求的队列”
             if (!zns->to_ftl[i] || !femu_ring_count(zns->to_ftl[i]))
                 continue;
-
+            // 从to_ftl[i]队列中取出1个请求
             rc = femu_ring_dequeue(zns->to_ftl[i], (void *)&req, 1);
             if (rc != 1) {
                 printf("FEMU: FTL to_ftl dequeue failed\n");
             }
 
             ftl_assert(req);
+            // 根据NVMe命令的操作码，分发到对应的处理逻辑
             switch (req->cmd.opcode) {
                 // Fix bug: zone append not respecting configured delay
                 case NVME_CMD_ZONE_APPEND:
@@ -355,9 +357,11 @@ static void *ftl_thread(void *arg)
                     ;
             }
 
+            // 记录请求的处理延迟
             req->reqlat = lat;
-            req->expire_time += lat;
+            req->expire_time += lat;// 更新请求过期时间（加延迟）
 
+            // 将处理完毕的请求，入队到对应的to_poller[i]队列
             rc = femu_ring_enqueue(zns->to_poller[i], (void *)&req, 1);
             if (rc != 1) {
                 ftl_err("FTL to_poller enqueue failed\n");
