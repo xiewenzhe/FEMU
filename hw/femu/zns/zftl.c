@@ -208,52 +208,66 @@ static uint64_t zns_wc_flush(struct zns_ssd* zns, int wcidx, int type,uint64_t s
     int flash_type = zns->flash_type;
     uint64_t sublat = 0, maxlat = 0;
 
+    /* i 指向当前还未刷入阵列的第一个 LPN。 */
     i = 0;
     while(i < zns->cache.write_cache[wcidx].used)
     {
+        /*
+         * 在当前 (channel, lun) 位置上，依次向各个 plane 分配页。
+         * 同一轮会把尽可能多的 LPN 条带化写到不同 plane 上。
+         */
         for(p = 0;p<zns->num_plane;p++){
-            /* new write */
+            /* 为当前 plane 生成一个新的物理写入位置，block 由 active_zone 决定。 */
             ppa = get_new_page(zns);
             ppa.g.pl = p;
             for(j = 0; j < flash_type ;j++)
             {
+                /* 取出该 block 在当前 plane 上的下一可写页。 */
                 ppa.g.pg = get_blk(zns,&ppa)->page_wp;
                 get_blk(zns,&ppa)->page_wp++;
                 for(subpage = 0;subpage < ZNS_PAGE_SIZE/LOGICAL_PAGE_SIZE;subpage++)
                 {
                     if(i+subpage >= zns->cache.write_cache[wcidx].used)
                     {
-                        //No need to write an invalid page
+                        /* 缓存中的有效 LPN 已经用完，不再填充无效子页。 */
                         break;
                     }
+                    /* 从写缓存中取出一个 LPN，准备映射到当前物理页的一个 subpage。 */
                     lpn = zns->cache.write_cache[wcidx].lpns[i+subpage];
                     oldppa = get_maptbl_ent(zns, lpn);
                     if (mapped_ppa(&oldppa)) {
-                        /* FIXME: Misao: update old page information*/
+                        /* FIXME: Misao: 旧映射失效后的元数据暂未维护。 */
                     }
+                    /* subpage 编号决定该 LPN 落在当前物理页中的哪个 4 KiB 片段。 */
                     ppa.g.spg = subpage;
-                    /* update maptbl */
+                    /* 更新 L2P 映射：记录这个 LPN 现在对应的新 PPA。 */
                     set_maptbl_ent(zns, lpn, &ppa);
                     //femu_log("[F] lpn:\t%lu\t-->ch:\t%u\tlun:\t%u\tpl:\t%u\tblk:\t%u\tpg:\t%u\tsubpg:\t%u\tlat\t%lu\n",lpn,ppa.g.ch,ppa.g.fc,ppa.g.pl,ppa.g.blk,ppa.g.pg,ppa.g.spg,sublat);
                 }
+                /* 一个 16 KiB 物理页最多承载 4 个 4 KiB LPN。 */
                 i+=ZNS_PAGE_SIZE/LOGICAL_PAGE_SIZE;
             }
-            //FIXME Misao: identify padding page
+            /* FIXME: Misao: 这里默认按有效页统计，尚未单独区分 padding page。 */
             if(ppa.g.V)
             {
                 struct nand_cmd swr;
                 swr.type = type;
                 swr.cmd = NAND_WRITE;
                 swr.stime = stime;
-                /* get latency statistics */
+                /* 按当前 plane 的可用时间推进一次 NAND program 时延。 */
                 sublat = zns_advance_status(zns, &ppa, &swr);
                 maxlat = (sublat > maxlat) ? sublat : maxlat;
             }
         }
-        /* need to advance the write pointer here */
+        /*
+         * 当前 (channel, lun) 这一轮的各个 plane 都写完后，
+         * 再把全局写指针推进到下一个 channel；channel 用完后推进 lun。
+         */
         zns_advance_write_pointer(zns);
     }
+    /* 刷写完成后，清空该写缓存槽位中的有效条目数。 */
     zns->cache.write_cache[wcidx].used = 0;
+    /* 返回本次 flush 中所有物理写的最大完成时延。 */
     return maxlat;
 }
 
@@ -261,17 +275,23 @@ static uint64_t zns_write(struct zns_ssd *zns, NvmeRequest *req)
 {
     uint64_t lba = req->slba;
     uint32_t nlb = req->nlb;
+    /* 将请求的 LBA 范围换算成 4 KiB 粒度的逻辑页号 LPN。 */
     uint64_t secs_per_pg = LOGICAL_PAGE_SIZE/zns->lbasz;
     uint64_t start_lpn = lba / secs_per_pg;
     uint64_t end_lpn = (lba + nlb - 1) / secs_per_pg;
     uint64_t lpn;
     uint64_t sublat = 0, maxlat = 0;
     int i;
+    /* 当前 zone 优先复用已经绑定到自己的写缓存槽位。 */
     int wcidx = zns_get_wcidx(zns);
 
     if(wcidx==-1)
     {
-        //need flush
+        /*
+         * 当前没有缓存槽位属于这个 zone。
+         * 优先找空闲槽位；如果没有空闲槽位，就复用一个已有槽位，
+         * 并在复用前先把其中暂存的 LPN 刷到 NAND 阵列。
+         */
         wcidx = 0;
         uint64_t t_used = zns->cache.write_cache[wcidx].used;
         for(i = 1;i < zns->cache.num_wc;i++)
@@ -289,23 +309,34 @@ static uint64_t zns_write(struct zns_ssd *zns, NvmeRequest *req)
             }
         }
         if(t_used) maxlat = zns_wc_flush(zns,wcidx,USER_IO,req->stime);
+        /* 将选中的缓存槽位绑定到当前请求所在的 zone。 */
         zns->cache.write_cache[wcidx].sblk = zns->active_zone;
     }
 
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
         if(zns->cache.write_cache[wcidx].used==zns->cache.write_cache[wcidx].cap)
         {
+            /*
+             * 当前写缓存已满，需要先把缓存中的 LPN 刷到阵列。
+             * 真正的 LPN->PPA 映射分配和 NAND 时延推进发生在 zns_wc_flush() 中；
+             * zns_write() 本身主要负责把 LPN 暂存在 SRAM 写缓存里。
+             */
             femu_log("[W] flush wc %d (%u/%u)\n",wcidx,(int)zns->cache.write_cache[wcidx].used,(int)zns->cache.write_cache[wcidx].cap);
             sublat = zns_wc_flush(zns,wcidx,USER_IO,req->stime);
             femu_log("[W] flush lat: %u\n", (int)sublat);
             maxlat = (sublat > maxlat) ? sublat : maxlat;
             sublat = 0;
         }
+        /* 将一个逻辑页先写入当前 zone 对应的 SRAM 写缓存。 */
         zns->cache.write_cache[wcidx].lpns[zns->cache.write_cache[wcidx].used++]=lpn;
         sublat += SRAM_WRITE_LATENCY_NS; //Simplified timing emulation
         maxlat = (sublat > maxlat) ? sublat : maxlat;
         femu_log("[W] lpn:\t%lu\t-->wc cache:%u, used:%u\n",lpn,(int)wcidx,(int)zns->cache.write_cache[wcidx].used);
     }
+    /*
+     * 返回这次请求看到的完成时延：
+     * 可能只是写入 SRAM 缓存的时延，也可能包含触发 flush 后更大的阵列写时延。
+     */
     return maxlat;
 }
 
