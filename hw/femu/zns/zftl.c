@@ -131,37 +131,36 @@ static uint64_t zns_advance_status(struct zns_ssd *zns, struct ppa *ppa,struct n
     uint64_t write_delay = zns->timing.pg_wr_lat[nand_type];
     uint64_t erase_delay = zns->timing.blk_er_lat[nand_type];
 
+    //增加代码
+    //old_avail：这个 plane 原来什么时候空闲
+    uint64_t old_avail = pl->next_plane_avail_time; 
+    //op_delay：本次操作本身要花多久
+    uint64_t op_delay = 0;
+    const char *cmd_name = "UNKNOWN";
+    //
     switch (c) {
     case NAND_READ:
-        /*
-         * 这里是后续插桩观察 slack 的核心位置：
-         *   old_avail     = 修改前的 pl->next_plane_avail_time
-         *   arrival_slack = max(0, req_stime - old_avail)
-         *   queue_wait    = max(0, old_avail - req_stime)
-         *
-         * 如果 req_stime 比 old_avail 晚，说明请求到达前 plane 已经空闲了一段时间；
-         * 如果 old_avail 比 req_stime 晚，说明请求需要等这个 plane。
-         */
-        nand_stime = (pl->next_plane_avail_time < req_stime) ? req_stime : \
-                     pl->next_plane_avail_time;
-        pl->next_plane_avail_time = nand_stime + read_delay;
-        lat = pl->next_plane_avail_time - req_stime;
+        // nand_stime = (pl->next_plane_avail_time < req_stime) ? req_stime : \ pl->next_plane_avail_time;
+        // pl->next_plane_avail_time = nand_stime + read_delay;
+        // lat = pl->next_plane_avail_time - req_stime;
+        op_delay = read_delay;
+        cmd_name = "READ";
 	    break;
 
     case NAND_WRITE:
-        /* 写和读使用同一套排队规则，只是推进 page program 时延。 */
-	    nand_stime = (pl->next_plane_avail_time < req_stime) ? req_stime : \
-		            pl->next_plane_avail_time;
-	    pl->next_plane_avail_time = nand_stime + write_delay;
-	    lat = pl->next_plane_avail_time - req_stime;
+	    // nand_stime = (pl->next_plane_avail_time < req_stime) ? req_stime : \ pl->next_plane_avail_time;
+	    // pl->next_plane_avail_time = nand_stime + write_delay;
+	    // lat = pl->next_plane_avail_time - req_stime;
+        op_delay = write_delay;
+        cmd_name = "WRITE";
 	    break;
 
     case NAND_ERASE:
-        /* 擦除也会占用目标 plane，通常比 read/write 更久。 */
-        nand_stime = (pl->next_plane_avail_time < req_stime) ? req_stime : \
-                        pl->next_plane_avail_time;
-        pl->next_plane_avail_time = nand_stime + erase_delay;
-        lat = pl->next_plane_avail_time - req_stime;
+        // nand_stime = (pl->next_plane_avail_time < req_stime) ? req_stime : \pl->next_plane_avail_time;
+        // pl->next_plane_avail_time = nand_stime + erase_delay;
+        // lat = pl->next_plane_avail_time - req_stime;
+        op_delay = erase_delay;
+        cmd_name = "ERASE";
         break;
 
     default:
@@ -169,6 +168,50 @@ static uint64_t zns_advance_status(struct zns_ssd *zns, struct ppa *ppa,struct n
         ;
     }
 
+     /*
+     * nand_stime：本次 NAND 操作真正开始的时间
+     * 如果 plane 已经空闲，就从 req_stime 开始；
+     * 如果 plane 还忙，就等到 old_avail。
+     */
+    nand_stime = (old_avail < req_stime) ? req_stime : old_avail;
+
+    /*
+     * 推进当前 plane 的时间线。
+     */
+    pl->next_plane_avail_time = nand_stime + op_delay;
+
+    /*
+     * 对请求可见的延迟 = 完成时间 - 请求到达时间。
+     */
+    lat = pl->next_plane_avail_time - req_stime;
+
+    /*
+     * 用于分析并行单元忙闲情况。
+     */
+    uint64_t finish_time = pl->next_plane_avail_time;
+    uint64_t queue_wait = (old_avail > req_stime) ? (old_avail - req_stime) : 0;
+    uint64_t idle_gap = (req_stime > old_avail) ? (req_stime - old_avail) : 0;
+
+    /*
+     * 每一行代表一次 NAND 子操作占用一个 plane 的时间段。
+     */
+    femu_log("[PU] cmd=%s req=%lu old_avail=%lu start=%lu finish=%lu delay=%lu lat=%lu wait=%lu idle=%lu "
+             "ch=%u lun=%u pl=%u blk=%u pg=%u spg=%u\n",
+             cmd_name, //读or写or擦除
+             req_stime, //请求到达时间
+             old_avail, //这个 plane 上一次操作在什么时刻结束
+             nand_stime, //操作的开始时间
+             finish_time, //操作的结束时间
+             op_delay, //操作的自身执行延迟
+             lat, //完成时间 - 请求到达时间
+             queue_wait, //排队等待时间
+             idle_gap, //这个plane的空闲时间
+             ppa->g.ch, //channel
+             ppa->g.fc, //flash chip
+             ppa->g.pl, //plane
+             ppa->g.blk, //block
+             ppa->g.pg, //page
+             ppa->g.spg); //subpage
     return lat;
 }
 
@@ -493,7 +536,7 @@ static uint64_t zns_write(struct zns_ssd *zns, NvmeRequest *req)
             maxlat = (sublat > maxlat) ? sublat : maxlat;
             sublat = 0;
         }
-        /* 将一个逻辑页先写入当前 zone 对应的 SRAM 写缓存。 */
+        /* 将一个逻辑页先写入当前 zone 对应的 SRAM 写缓存。 */  
         zns->cache.write_cache[wcidx].lpns[zns->cache.write_cache[wcidx].used++]=lpn;
 
         /*
