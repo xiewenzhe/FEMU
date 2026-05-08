@@ -357,6 +357,7 @@ static uint64_t zns_wc_flush(struct zns_ssd* zns, int wcidx, int type,uint64_t s
                  * 每分配一个物理 page 就立刻递增，避免后续写覆盖同一页。
                  */
                 get_blk(zns,&ppa)->page_wp++;
+                //遍历一个物理 page 内部的 subpage
                 for(subpage = 0;subpage < ZNS_PAGE_SIZE/LOGICAL_PAGE_SIZE;subpage++)
                 {
                     if(i+subpage >= zns->cache.write_cache[wcidx].used)
@@ -385,6 +386,7 @@ static uint64_t zns_wc_flush(struct zns_ssd* zns, int wcidx, int type,uint64_t s
                 i+=ZNS_PAGE_SIZE/LOGICAL_PAGE_SIZE;
             }
             /* FIXME: 这里默认按有效页统计，尚未单独区分 padding page。 */
+            //判断 PPA 是否有效
             if(ppa.g.V)
             {
                 struct nand_cmd swr;
