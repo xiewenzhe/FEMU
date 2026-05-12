@@ -5,6 +5,24 @@
 static void *ftl_thread(void *arg);
 
 /*
+ * 读取请求内部“slack”动机实验的采样项。
+ *slack
+ * 一条主机读取请求可能会被拆成多个 NAND 读取子操作。为了复现
+ * Slacker 论文中的动机实验，我们记录每个子操作的延迟和目标闪存平面，
+ * 等整条读取请求的所有子操作都处理完后，再和最慢的那个子操作比较。
+ */
+struct zns_read_slack_sample {
+    uint64_t lpn; //逻辑页号
+    uint64_t sublat;
+    uint16_t ch;
+    uint16_t lun;
+    uint16_t pl;
+};
+
+/* 只用于把多行子操作日志关联到同一条主机读取请求。 */
+static uint64_t zns_read_slack_reqid;
+
+/*
  * 读这个文件先记住几组名词：
  * req 是一条 NVMe 请求；LBA 是主机看到的逻辑块；LPN 是 FTL 内部 4KiB 逻辑页；
  * PPA 是物理地址，拆成 ch/fc(这里相当于 LUN)/pl/blk/pg/spg；
@@ -281,7 +299,7 @@ static uint64_t zns_read(struct zns_ssd *zns, NvmeRequest *req)
     uint32_t nlb = req->nlb;
 
     /*
-     * secs_per_pg 表示一个 4KiB FTL 逻辑页包含多少个 NVMe LBA。
+     * secs_per_pg 表示一个 4KiB = 4*1024B FTL 逻辑页包含多少个 NVMe LBA。
      * 例如 zns->lbasz=512B 时，secs_per_pg=4096/512=8。
      */
     uint64_t secs_per_pg = LOGICAL_PAGE_SIZE/zns->lbasz;
@@ -301,6 +319,19 @@ static uint64_t zns_read(struct zns_ssd *zns, NvmeRequest *req)
      * 请求完成时间由最慢的那个子读决定。
      */
     uint64_t sublat, maxlat = 0;
+    /*
+     * 当前读取请求的动机实验数据：
+     *   sublat：单个 NAND 读取子操作的延迟
+     *   maxlat：整条主机读取请求的延迟，由最慢的子操作决定
+     *   松弛时间：maxlat - sublat
+     */
+    uint64_t nr_lpn = end_lpn - start_lpn + 1; //计算这条请求一共覆盖了多少个 LPN。
+    uint64_t sample_cnt = 0; //子请求数量
+    uint64_t minlat = ~0ULL; //表示一个 uint64_t 能表示的最大值
+    uint64_t sumlat = 0; 
+    struct zns_read_slack_sample *samples;
+
+    samples = g_malloc0(sizeof(*samples) * nr_lpn);
 
     /* 普通读路径：逐个 LPN 查表并发起 NAND_READ。 */
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
@@ -330,8 +361,76 @@ static uint64_t zns_read(struct zns_ssd *zns, NvmeRequest *req)
 
         sublat = zns_advance_status(zns, &ppa, &srd);
         femu_log("[R] lpn:\t%lu\t<--ch:\t%u\tlun:\t%u\tpl:\t%u\tblk:\t%u\tpg:\t%u\tsubpg:\t%u\tlat\t%lu\n",lpn,ppa.g.ch,ppa.g.fc,ppa.g.pl,ppa.g.blk,ppa.g.pg,ppa.g.spg,sublat);
+
+        /*
+         * 先保存这个 NAND 读取子操作。这里还不能立刻计算松弛时间，因为只有
+         * 同一条读取请求的所有子操作都处理完后，才知道哪个是最慢的关键子操作。
+         */
+        samples[sample_cnt].lpn = lpn;
+        samples[sample_cnt].sublat = sublat;
+        samples[sample_cnt].ch = ppa.g.ch;
+        samples[sample_cnt].lun = ppa.g.fc;
+        samples[sample_cnt].pl = ppa.g.pl;
+        sample_cnt++;
+        minlat = (sublat < minlat) ? sublat : minlat;
+        sumlat += sublat;
         maxlat = (sublat > maxlat) ? sublat : maxlat;
     }
+
+    if (sample_cnt) {
+        /*
+         * 整条主机读取请求在 maxlat 时刻完成。任何 sublat < maxlat 的子操作
+         * 都存在请求内部松弛时间，理论上可以被 Slacker 类调度器利用。
+         */
+        uint64_t reqid = zns_read_slack_reqid++; //为这条读请求分配一个 reqid
+        uint64_t total_slack = 0;
+        uint64_t max_slack = 0;
+        uint64_t unique_planes = 0; //这条读请求覆盖了多少个不同的 flash plane
+        uint64_t i, j;
+
+        for (i = 0; i < sample_cnt; i++) { //遍历每个子请求
+            uint64_t slack = maxlat - samples[i].sublat;
+            bool seen = false; //表示当前这个 plane 之前是否已经出现过
+
+            total_slack += slack;
+            max_slack = (slack > max_slack) ? slack : max_slack;
+
+            for (j = 0; j < i; j++) {
+                if (samples[i].ch == samples[j].ch &&
+                    samples[i].lun == samples[j].lun &&
+                    samples[i].pl == samples[j].pl) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) {
+                unique_planes++;
+            }
+
+            /*
+             * 子操作级日志：后续可以用 slack_ns 字段画“松弛时间”的累计分布图，
+             * 对应 Slacker 论文动机实验中的松弛时间分布。
+             */
+            ftl_log("ZNS_READ_SUBSLACK,reqid=%lu,subidx=%lu,lpn=%lu,"
+                    "ch=%u,lun=%u,pl=%u,sublat_ns=%lu,slack_ns=%lu\n",
+                    reqid, i, samples[i].lpn, samples[i].ch, samples[i].lun,
+                    samples[i].pl, samples[i].sublat, slack);
+        }
+
+        /*
+         * 请求级汇总日志：unique_planes 是 FEMU/ZNS 里的等价指标，用来表示
+         * 一条读取请求实际覆盖了多少个内部闪存平面资源。
+         */
+        ftl_log("ZNS_READ_SLACK,reqid=%lu,slba=%lu,nlb=%u,subops=%lu,"
+                "unique_planes=%lu,minlat_ns=%lu,maxlat_ns=%lu,"
+                "avg_sublat_ns=%lu,total_slack_ns=%lu,avg_slack_ns=%lu,"
+                "max_slack_ns=%lu\n",
+                reqid, lba, nlb, sample_cnt, unique_planes, minlat, maxlat,
+                sumlat / sample_cnt, total_slack, total_slack / sample_cnt,
+                max_slack);
+    }
+
+    g_free(samples);
 
     return maxlat;
 }
