@@ -18,6 +18,7 @@ struct zns_read_slack_sample {
     uint64_t lpn;          /* 这个子请求对应的 4KiB 逻辑页号。 */
     struct ppa ppa;        /* LPN 查表得到的真实物理页地址。 */
     uint64_t sublat;       /* 真实执行后观测到的子请求延迟。 */
+    uint64_t read_delay;   /* 这个 NAND read 自身的服务时间。 */
     uint64_t est_start;    /* 估计的 NAND read 开始时间。 */
     uint64_t est_finish;   /* 估计的 NAND read 完成时间。 */
     uint64_t est_sublat;   /* 估计的子请求延迟：est_finish - req_stime。 */
@@ -41,8 +42,58 @@ struct zns_read_shadow_plane {
     uint64_t avail;        /* shadow 里的 plane 下一次可用时间。 */
 };
 
+/*
+ * dry-run 队列中的一个 read 子请求。
+ *
+ * 这不是新的真实调度队列，只是为了分析 read bypass 机会而保存的 baseline
+ * 队列快照。每个字段的含义如下：
+ *   reqid/subidx/lpn：唯一定位这个 read 子请求来自哪条 host read、哪一个子请求；
+ *   req_stime：它所属 host read 到达 FTL 的时间；
+ *   start/finish：baseline 顺序下，这个子请求在目标 plane 的开始/结束时间；
+ *   deadline：它所属 host read 在 baseline 下的完成时间；
+ *   slack：这个子请求在 baseline 下还能容忍多少额外延迟；
+ *   read_delay：这个子请求本身占用 plane 的服务时间；
+ *   ch/lun/pl：它落到哪个内部 plane，主要用于日志核对。
+ */
+//记录一个 read 子请求做绕行判断时需要知道的全部信息
+struct zns_read_bypass_entry {
+    uint64_t reqid;
+    uint64_t subidx;
+    uint64_t lpn;
+    uint64_t req_stime;
+    uint64_t start;
+    uint64_t finish;
+    uint64_t deadline;
+    uint64_t slack;
+    uint64_t read_delay;
+    uint16_t ch;
+    uint16_t lun;
+    uint16_t pl;
+};
+
+/*
+ * 每个 plane 对应一个 dry-run read 队列。
+ *
+ * entries 按 baseline 服务顺序保存仍未开始的 read 子请求：
+ *   entries[0]      是离队头最近、最早会被服务的 waiting read；
+ *   entries[len-1]  是队尾，也是新 read 做 Slacker 式前移时首先检查的对象。
+ */
+//每个 plane 自己的 dry-run read 队列
+struct zns_read_bypass_queue {
+    struct zns_read_bypass_entry *entries;
+    uint64_t len;
+    uint64_t cap;
+};
+
+#define ZNS_BYPASS_MAX_CH   (1 << CH_BITS)
+#define ZNS_BYPASS_MAX_LUN  (1 << FC_BITS)
+#define ZNS_BYPASS_MAX_PL   (1 << PL_BITS)
+#define ZNS_BYPASS_MAX_PLANES \
+    (ZNS_BYPASS_MAX_CH * ZNS_BYPASS_MAX_LUN * ZNS_BYPASS_MAX_PL)
+
 /* 只用于把多行子操作日志关联到同一条主机读取请求。 */
 static uint64_t zns_read_slack_reqid;
+static struct zns_read_bypass_queue zns_read_bypass_queues[ZNS_BYPASS_MAX_PLANES];
 
 static inline uint64_t zns_absdiff_u64(uint64_t a, uint64_t b)
 {
@@ -64,6 +115,245 @@ static struct zns_read_shadow_plane *zns_find_read_shadow_plane(
     }
 
     return NULL;
+}
+
+//把 PPA 映射到队列下标
+static int zns_read_bypass_plane_idx(struct ppa *ppa)
+{
+    if (ppa->g.ch >= ZNS_BYPASS_MAX_CH ||
+        ppa->g.fc >= ZNS_BYPASS_MAX_LUN ||
+        ppa->g.pl >= ZNS_BYPASS_MAX_PL) {
+        //如果字段越界，就返回-1
+        return -1;
+    }
+
+    //idx = ch * LUN数 * PL数 + lun * PL数 + pl
+    return ppa->g.ch * ZNS_BYPASS_MAX_LUN * ZNS_BYPASS_MAX_PL +
+           ppa->g.fc * ZNS_BYPASS_MAX_PL + ppa->g.pl;
+}
+
+//根据 PPA 找到对应 plane 队列
+static struct zns_read_bypass_queue *zns_read_bypass_get_queue(struct ppa *ppa)
+{
+    //算出队列下标
+    int idx = zns_read_bypass_plane_idx(ppa);
+
+    if (idx < 0) {
+        return NULL;
+    }
+
+    //下标合法返回这个 PPA 所属 plane 的 dry-run read 队列
+    return &zns_read_bypass_queues[idx];
+}
+
+//清空某个 plane 上记录的 pending read 队列。
+static void zns_read_bypass_clear_queue(struct ppa *ppa)
+{
+    struct zns_read_bypass_queue *queue = zns_read_bypass_get_queue(ppa);
+
+    if (queue) {
+        queue->len = 0;
+    }
+}
+
+/*
+ * 已经开始执行的 read 不能再被后来请求绕过，所以它们不应继续留在 dry-run
+ * 队列里。队列按 baseline start 时间有序，前缀一旦开始就可以整体删掉。
+ */
+//删除已经开始执行的 read。prune:删除
+static void zns_read_bypass_prune_started(struct zns_read_bypass_queue *queue,
+                                          uint64_t read_stime)
+{
+    uint64_t drop = 0;
+    uint64_t i;
+
+    while (drop < queue->len && queue->entries[drop].start <= read_stime) {
+        drop++;
+    }
+
+    if (!drop) {
+        return;
+    }
+
+    //把剩下的 entry 前移，维持队列连续
+    for (i = drop; i < queue->len; i++) {
+        queue->entries[i - drop] = queue->entries[i];
+    }
+    queue->len -= drop;
+}
+
+//往队列尾部加入一个 read entry
+static void zns_read_bypass_queue_push(struct zns_read_bypass_queue *queue,
+                                       struct zns_read_bypass_entry *entry)
+{
+    if (queue->len == queue->cap) {
+        uint64_t new_cap = queue->cap ? queue->cap * 2 : 8;
+
+        queue->entries = g_realloc(queue->entries,
+                                   sizeof(*queue->entries) * new_cap);
+        queue->cap = new_cap;
+    }
+
+    queue->entries[queue->len++] = *entry;
+}
+
+//把一个真实 read 子请求记录到 dry-run 队列
+static void zns_read_bypass_remember_read(uint64_t reqid, uint64_t subidx,
+                                          struct zns_read_slack_sample *sample,
+                                          uint64_t read_stime,
+                                          uint64_t req_maxlat)
+{
+    struct zns_read_bypass_queue *queue =
+        zns_read_bypass_get_queue(&sample->ppa);
+    struct zns_read_bypass_entry entry;
+
+    if (!queue) {
+        return;
+    }
+
+    entry.reqid = reqid;
+    entry.subidx = subidx;
+    entry.lpn = sample->lpn;
+    entry.req_stime = read_stime;
+    entry.finish = read_stime + sample->sublat;
+    entry.start = entry.finish - sample->read_delay;
+    entry.deadline = read_stime + req_maxlat;
+    entry.slack = entry.deadline - entry.finish;
+    entry.read_delay = sample->read_delay;
+    entry.ch = sample->ch;
+    entry.lun = sample->lun;
+    entry.pl = sample->pl;
+
+    zns_read_bypass_queue_push(queue, &entry);
+}
+
+/*
+ * 按 Slacker 的方式做多次前移 dry-run：
+ * incoming read 从 plane 队尾向队头扫描，只要 waiting read 的 slack 足以
+ * 容纳 incoming read 的服务时间，就假设可以继续向前跨过它。
+ *
+ * 注意：dry-run 不会真的改 entries 顺序，也不会把 victim->slack 写回扣减；
+ * 它只回答“在当前 baseline 队列上，这个 read 最多能向前跨过多少个 read”。
+ */
+//对当前 host read 里的每个 read 子请求，在不改变真实调度的前提下，判断它能不能在对应 plane 队列
+//中向前绕过前面的 waiting read。
+static void zns_read_bypass_dryrun(uint64_t reqid,
+                                   struct zns_read_slack_sample *samples,
+                                   uint64_t sample_cnt,
+                                   uint64_t read_stime)
+{
+    uint64_t candidate_subops = 0; //有机会参与 bypass 判断的子请求数
+    uint64_t bypassable_subops = 0; //实际可以绕过至少一个 waiting read 的子请求数
+    uint64_t total_hops = 0; //所有子请求一共能绕过多少个 waiting read
+    uint64_t total_benefit = 0; //总共理论上能提前多少时间
+    uint64_t max_hops = 0; //单个子请求最多能绕过几个 waiting read
+    uint64_t max_benefit = 0; //单个子请求最大理论收益
+    uint64_t i;
+
+    //逐个子请求找对应 plane 队列
+    for (i = 0; i < sample_cnt; i++) {
+        struct zns_read_bypass_queue *queue =
+            zns_read_bypass_get_queue(&samples[i].ppa);
+        uint64_t hops = 0;
+        uint64_t bypass_start = 0;
+        uint64_t bypass_finish = 0;
+        uint64_t benefit = 0;
+        uint64_t pos;
+
+        if (!queue) {
+            continue;
+        }
+
+        //删掉已经开始执行的 waiting read。
+        zns_read_bypass_prune_started(queue, read_stime);
+
+        //如果队列为空：说明当前 plane 上没有可绕过的 pending read，直接跳过
+        if (!queue->len) {
+            continue;
+        }
+
+        /*
+         * 如果队尾 read 的 finish 不是当前 read 的 baseline start，说明两者
+         * 中间还夹了别的真实操作；保守起见不跨越这个空档或非 read 操作。
+         */
+        if (queue->entries[queue->len - 1].finish != samples[i].est_start) {
+            continue;
+        }
+
+        /*
+          1. 有对应 plane 队列；
+          2. 队列中有 waiting read；
+          3. 队尾 waiting read 与当前 read 在 baseline 时间线上连续；
+        */
+        // 因此这个子请求是一个 bypass 候选
+        candidate_subops++;
+
+        //从队尾向队头扫描，multi-hop bypass
+        for (pos = queue->len; pos > 0; pos--) {
+            struct zns_read_bypass_entry *victim = &queue->entries[pos - 1];
+            uint64_t victim_new_slack;
+
+            /*
+             * 论文中的条件：waiting sub-request 的 slack 必须不小于
+             * incoming sub-request 的预计服务时间。
+             */
+            if (victim->slack < samples[i].read_delay) {
+                break;
+            }
+
+            victim_new_slack = victim->slack - samples[i].read_delay;
+            hops++;
+            bypass_start = victim->start;
+
+            //当前 incoming read 成功绕过了哪个 victim，以及 victim 被扣减 slack 后还剩多少。
+            ftl_log("ZNS_READ_BYPASS_DRYRUN_HOP,reqid=%lu,subidx=%lu,lpn=%lu,"
+                    "ch=%u,lun=%u,pl=%u,hop=%lu,victim_reqid=%lu,"
+                    "victim_subidx=%lu,victim_lpn=%lu,victim_start_ns=%lu,"
+                    "victim_finish_ns=%lu,victim_deadline_ns=%lu,"
+                    "victim_slack_ns=%lu,victim_new_slack_ns=%lu,"
+                    "slack_used_ns=%lu\n",
+                    reqid, i, samples[i].lpn, samples[i].ch, samples[i].lun,
+                    samples[i].pl, hops, victim->reqid, victim->subidx,
+                    victim->lpn, victim->start, victim->finish,
+                    victim->deadline, victim->slack, victim_new_slack,
+                    samples[i].read_delay);
+        }
+
+        //没有绕过任何 waiting read，就跳过
+        if (!hops) {
+            continue;
+        }
+
+        bypass_finish = bypass_start + samples[i].read_delay;
+        benefit = (samples[i].est_finish > bypass_finish) ?
+            (samples[i].est_finish - bypass_finish) : 0;
+        bypassable_subops++;
+        total_hops += hops;
+        total_benefit += benefit;
+        max_hops = (hops > max_hops) ? hops : max_hops;
+        max_benefit = (benefit > max_benefit) ? benefit : max_benefit;
+
+        //当前 subop 能绕过几个 waiting read
+        //baseline 下什么时候开始/结束
+        //dry-run 下什么时候开始/结束
+        //理论收益是多少
+        ftl_log("ZNS_READ_BYPASS_DRYRUN,reqid=%lu,subidx=%lu,lpn=%lu,"
+                "ch=%u,lun=%u,pl=%u,queue_len=%lu,hops=%lu,"
+                "baseline_start_ns=%lu,baseline_finish_ns=%lu,"
+                "bypass_start_ns=%lu,bypass_finish_ns=%lu,benefit_ns=%lu\n",
+                reqid, i, samples[i].lpn, samples[i].ch, samples[i].lun,
+                samples[i].pl, queue->len, hops, samples[i].est_start,
+                samples[i].est_finish, bypass_start, bypass_finish, benefit);
+    }
+    //这条 host read 内部有多少子请求有 bypass 判断条件，
+    //其中多少真的能 bypass，最多能前移几步，总理论收益是多少。
+    if (candidate_subops) {
+        ftl_log("ZNS_READ_BYPASS_DRYRUN_SUMMARY,reqid=%lu,subops=%lu,"
+                "candidate_subops=%lu,bypassable_subops=%lu,total_hops=%lu,"
+                "max_hops=%lu,total_benefit_ns=%lu,max_benefit_ns=%lu\n",
+                reqid, sample_cnt, candidate_subops, bypassable_subops,
+                total_hops, max_hops, total_benefit, max_benefit);
+    }
 }
 
 /*
@@ -199,6 +489,15 @@ static uint64_t zns_advance_status(struct zns_ssd *zns, struct ppa *ppa,struct n
     //op_delay：本次操作本身要花多久
     uint64_t op_delay = 0;
     const char *cmd_name = "UNKNOWN";
+
+    /*
+     * 当前 dry-run 只讨论 read 绕过 read。
+     * 某个 plane 一旦出现 write/erase，就把它的 dry-run read 队列清空，
+     * 保守地避免后续 read 跨过这些非读操作。
+     */
+    if (ncmd->cmd != NAND_READ) {
+        zns_read_bypass_clear_queue(ppa);
+    }
 
     //
     switch (c) {
@@ -383,6 +682,7 @@ static uint64_t zns_read(struct zns_ssd *zns, NvmeRequest *req)
     uint64_t sample_cnt = 0; //子请求数量
     uint64_t minlat = ~0ULL; //表示一个 uint64_t 能表示的最大值
     uint64_t sumlat = 0; 
+    uint64_t reqid = 0;
     struct zns_read_slack_sample *samples;
 
     samples = g_malloc0(sizeof(*samples) * nr_lpn);
@@ -411,6 +711,14 @@ static uint64_t zns_read(struct zns_ssd *zns, NvmeRequest *req)
         samples[sample_cnt].lun = ppa.g.fc;
         samples[sample_cnt].pl = ppa.g.pl;
         sample_cnt++;
+    }
+
+    if (sample_cnt) {
+        /*
+         * dry-run 在真实执行前就要打日志，所以 reqid 需要提前分配。
+         * 后面的 slack / estimator 日志继续复用同一个 reqid。
+         */
+        reqid = zns_read_slack_reqid++;
     }
 
     if (sample_cnt) {
@@ -451,6 +759,7 @@ static uint64_t zns_read(struct zns_ssd *zns, NvmeRequest *req)
             }
 
             read_delay = zns->timing.pg_rd_lat[get_blk(zns, sppa)->nand_type];
+            samples[i].read_delay = read_delay;
 
             /*
              * 这几行就是在线估计的核心：
@@ -484,6 +793,14 @@ static uint64_t zns_read(struct zns_ssd *zns, NvmeRequest *req)
         }
 
         g_free(shadow_planes);
+    }
+
+    if (sample_cnt) {
+        /*
+         * 只做机会统计，不改真实调度：按论文方式从 plane 队尾向前扫描，
+         * 看当前 read 子请求最多能跨过多少个 waiting read。
+         */
+        zns_read_bypass_dryrun(reqid, samples, sample_cnt, read_stime);
     }
 
     /*
@@ -534,7 +851,6 @@ static uint64_t zns_read(struct zns_ssd *zns, NvmeRequest *req)
         uint64_t est_max_slack = 0;
         uint64_t total_sublat_err = 0;
         uint64_t total_slack_err = 0;
-        uint64_t reqid = zns_read_slack_reqid++; //为这条读请求分配一个 reqid
         uint64_t unique_planes = 0; //这条读请求覆盖了多少个不同的 flash plane
         uint64_t i, j;
 
@@ -592,6 +908,13 @@ static uint64_t zns_read(struct zns_ssd *zns, NvmeRequest *req)
                     samples[i].pl, samples[i].est_start, samples[i].est_finish,
                     samples[i].est_sublat, est_slack, samples[i].sublat,
                     slack, sublat_err, slack_err);
+
+            /*
+             * 把当前 read 子请求按 baseline 顺序放入对应 plane 的 dry-run
+             * 队列，供后续 host read 从队尾向前扫描。这里只记录，不重排。
+             */
+            zns_read_bypass_remember_read(reqid, i, &samples[i],
+                                          read_stime, maxlat);
         }
 
         /*
