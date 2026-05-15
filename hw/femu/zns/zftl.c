@@ -5,22 +5,66 @@
 static void *ftl_thread(void *arg);
 
 /*
- * 读取请求内部“slack”动机实验的采样项。
- *slack
- * 一条主机读取请求可能会被拆成多个 NAND 读取子操作。为了复现
- * Slacker 论文中的动机实验，我们记录每个子操作的延迟和目标闪存平面，
- * 等整条读取请求的所有子操作都处理完后，再和最慢的那个子操作比较。
+ * 一条 host read 会被拆成多个 NAND read 子请求。
+ *
+ * 这个结构体保存其中一个子请求的信息：
+ *   - 没有 est_ 前缀的字段是真实执行后观测到的结果；
+ *   - 有est_ 前缀：estimated，表示“估计值”，是在真正执行前用 shadow
+ *     plane 时间线模拟出来的结果。
+ *
+ * 这里的在线估计只用于观察 estimator 是否准确，不改变真实调度顺序。
  */
 struct zns_read_slack_sample {
-    uint64_t lpn; //逻辑页号
-    uint64_t sublat;
+    uint64_t lpn;          /* 这个子请求对应的 4KiB 逻辑页号。 */
+    struct ppa ppa;        /* LPN 查表得到的真实物理页地址。 */
+    uint64_t sublat;       /* 真实执行后观测到的子请求延迟。 */
+    uint64_t est_start;    /* 估计的 NAND read 开始时间。 */
+    uint64_t est_finish;   /* 估计的 NAND read 完成时间。 */
+    uint64_t est_sublat;   /* 估计的子请求延迟：est_finish - req_stime。 */
+    uint64_t est_slack;    /* 估计的 slack：est_maxlat - est_sublat。 */
+    uint16_t ch;           /* 目标 channel。 */
+    uint16_t lun;          /* 目标 LUN/chip。 */
+    uint16_t pl;           /* 目标 plane。 */
+};
+
+/*
+ * 估计阶段使用的“草稿纸”plane 时间线。
+ *
+ * 真实调度会更新 pl->next_plane_avail_time；估计阶段不能提前修改真实
+ * 时间线，所以把目标 plane 当前的 next_plane_avail_time 抄到 avail，
+ * 然后只在这个 shadow 结构里模拟排队和完成时间。
+ */
+struct zns_read_shadow_plane {
     uint16_t ch;
     uint16_t lun;
     uint16_t pl;
+    uint64_t avail;        /* shadow 里的 plane 下一次可用时间。 */
 };
 
 /* 只用于把多行子操作日志关联到同一条主机读取请求。 */
 static uint64_t zns_read_slack_reqid;
+
+static inline uint64_t zns_absdiff_u64(uint64_t a, uint64_t b)
+{
+    return (a > b) ? (a - b) : (b - a);
+}
+
+/* 在当前 host read 的 shadow plane 表里查找某个 PPA 对应的 plane。 */
+static struct zns_read_shadow_plane *zns_find_read_shadow_plane(
+    struct zns_read_shadow_plane *planes, uint64_t nr_planes, struct ppa *ppa)
+{
+    uint64_t i;
+
+    for (i = 0; i < nr_planes; i++) {
+        if (planes[i].ch == ppa->g.ch &&
+            planes[i].lun == ppa->g.fc &&
+            planes[i].pl == ppa->g.pl) {
+            return &planes[i];
+        }
+    }
+
+    return NULL;
+}
 
 /*
  * 读这个文件先记住几组名词：
@@ -155,6 +199,7 @@ static uint64_t zns_advance_status(struct zns_ssd *zns, struct ppa *ppa,struct n
     //op_delay：本次操作本身要花多久
     uint64_t op_delay = 0;
     const char *cmd_name = "UNKNOWN";
+
     //
     switch (c) {
     case NAND_READ:
@@ -320,6 +365,15 @@ static uint64_t zns_read(struct zns_ssd *zns, NvmeRequest *req)
      */
     uint64_t sublat, maxlat = 0;
     /*
+     * est 是 estimated 的缩写，表示“在线估计值”。
+     * 这些值在真实调度前用 shadow plane 时间线算出，后面会和真实观测值对比。
+     */
+    uint64_t est_maxlat = 0;
+    uint64_t est_minlat = ~0ULL;
+    uint64_t est_sumlat = 0;
+    uint64_t read_stime = (req->stime == 0) ? \
+        qemu_clock_get_ns(QEMU_CLOCK_REALTIME) : req->stime;
+    /*
      * 当前读取请求的动机实验数据：
      *   sublat：单个 NAND 读取子操作的延迟
      *   maxlat：整条主机读取请求的延迟，由最慢的子操作决定
@@ -333,7 +387,13 @@ static uint64_t zns_read(struct zns_ssd *zns, NvmeRequest *req)
 
     samples = g_malloc0(sizeof(*samples) * nr_lpn);
 
-    /* 普通读路径：逐个 LPN 查表并发起 NAND_READ。 */
+    /*
+     * 第一步：只收集这条 host read 的所有有效 NAND read 子请求。
+     *
+     * 原来的代码是一边查 LPN，一边立刻调用 zns_advance_status()。
+     * 现在为了在真实执行前估计 slack，先只把 LPN/PPA/plane 记下来，
+     * 暂时不更新任何 plane 的 next_plane_avail_time。
+     */
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
         /* LPN -> PPA：先查逻辑页当前映射到哪个物理页。 */
         ppa = get_maptbl_ent(zns, lpn);
@@ -344,6 +404,97 @@ static uint64_t zns_read(struct zns_ssd *zns, NvmeRequest *req)
              */
             continue;
         }
+
+        samples[sample_cnt].lpn = lpn;
+        samples[sample_cnt].ppa = ppa;
+        samples[sample_cnt].ch = ppa.g.ch;
+        samples[sample_cnt].lun = ppa.g.fc;
+        samples[sample_cnt].pl = ppa.g.pl;
+        sample_cnt++;
+    }
+
+    if (sample_cnt) {
+        /*
+         * 第二步：在 shadow plane timeline 上“假装执行”这些 read 子请求。
+         *
+         * 对每个子请求：
+         *   est_start  = max(req到达时间, shadow plane 可用时间)
+         *   est_finish = est_start + read_delay
+         *   est_sublat = est_finish - req到达时间
+         *
+         * 然后只更新 shadow->avail，不更新真实的 pl->next_plane_avail_time。
+         * 这样可以提前得到估计 slack，又不会改变当前 FEMU baseline 行为。
+         */
+        struct zns_read_shadow_plane *shadow_planes;
+        uint64_t shadow_cnt = 0;
+        uint64_t i;
+
+        shadow_planes = g_malloc0(sizeof(*shadow_planes) * sample_cnt);
+
+        for (i = 0; i < sample_cnt; i++) {
+            struct ppa *sppa = &samples[i].ppa;
+            struct zns_read_shadow_plane *shadow;
+            uint64_t read_delay;
+
+            shadow = zns_find_read_shadow_plane(shadow_planes, shadow_cnt, sppa);
+            if (!shadow) {
+                /*
+                 * 第一次遇到这个 plane，把真实 next_plane_avail_time 抄到
+                 * shadow->avail。之后同一个 host read 内再访问这个 plane，
+                 * 就沿用 shadow->avail 模拟该 plane 上的排队。
+                 */
+                shadow = &shadow_planes[shadow_cnt++];
+                shadow->ch = sppa->g.ch;
+                shadow->lun = sppa->g.fc;
+                shadow->pl = sppa->g.pl;
+                shadow->avail = get_plane(zns, sppa)->next_plane_avail_time;
+            }
+
+            read_delay = zns->timing.pg_rd_lat[get_blk(zns, sppa)->nand_type];
+
+            /*
+             * 这几行就是在线估计的核心：
+             * 如果 shadow plane 已经空闲，就从 read_stime 开始；
+             * 如果 shadow plane 还忙，就等到 shadow->avail 再开始。
+             */
+            samples[i].est_start = (shadow->avail < read_stime) ? \
+                read_stime : shadow->avail;
+            samples[i].est_finish = samples[i].est_start + read_delay;
+            samples[i].est_sublat = samples[i].est_finish - read_stime;
+
+            /*
+             * 只推进 shadow 时间线。真实 plane 时间线稍后仍由
+             * zns_advance_status() 推进。
+             */
+            shadow->avail = samples[i].est_finish;
+
+            est_minlat = (samples[i].est_sublat < est_minlat) ? \
+                samples[i].est_sublat : est_minlat;
+            est_sumlat += samples[i].est_sublat;
+            est_maxlat = (samples[i].est_sublat > est_maxlat) ? \
+                samples[i].est_sublat : est_maxlat;
+        }
+
+        for (i = 0; i < sample_cnt; i++) {
+            /*
+             * host read 的完成时间由最慢的子请求决定。
+             * 子请求估计 slack = 估计最慢延迟 - 当前子请求估计延迟。
+             */
+            samples[i].est_slack = est_maxlat - samples[i].est_sublat;
+        }
+
+        g_free(shadow_planes);
+    }
+
+    /*
+     * 第三步：按原来的方式真实发起 NAND_READ。
+     *
+     * 前面的估计只碰 shadow，所以这里仍然由 zns_advance_status() 推进真实
+     * plane 时间线，并返回真实观测到的 sublat。也就是说，本次改动只增加
+     * 估计和日志，不改变 read 请求的真实完成时间。
+     */
+    for (uint64_t i = 0; i < sample_cnt; i++) {
+        ppa = samples[i].ppa;
 
         /*
          * 为当前 LPN 构造一个 NAND page read 子命令。
@@ -357,21 +508,16 @@ static uint64_t zns_read(struct zns_ssd *zns, NvmeRequest *req)
          * 同一条 NVMe 请求内的所有子读都使用 req->stime 作为到达时间。
          * 如果它们落到不同 plane，就可以在模型里并行推进。
          */
-        srd.stime = req->stime;
+        srd.stime = read_stime;
 
         sublat = zns_advance_status(zns, &ppa, &srd);
-        femu_log("[R] lpn:\t%lu\t<--ch:\t%u\tlun:\t%u\tpl:\t%u\tblk:\t%u\tpg:\t%u\tsubpg:\t%u\tlat\t%lu\n",lpn,ppa.g.ch,ppa.g.fc,ppa.g.pl,ppa.g.blk,ppa.g.pg,ppa.g.spg,sublat);
+        femu_log("[R] lpn:\t%lu\t<--ch:\t%u\tlun:\t%u\tpl:\t%u\tblk:\t%u\tpg:\t%u\tsubpg:\t%u\tlat\t%lu\n",samples[i].lpn,ppa.g.ch,ppa.g.fc,ppa.g.pl,ppa.g.blk,ppa.g.pg,ppa.g.spg,sublat);
 
         /*
-         * 先保存这个 NAND 读取子操作。这里还不能立刻计算松弛时间，因为只有
-         * 同一条读取请求的所有子操作都处理完后，才知道哪个是最慢的关键子操作。
+         * 保存真实观测到的子请求延迟。这里还不能立刻计算真实 slack，
+         * 因为只有所有子请求都执行完后，才知道真实 maxlat。
          */
-        samples[sample_cnt].lpn = lpn;
-        samples[sample_cnt].sublat = sublat;
-        samples[sample_cnt].ch = ppa.g.ch;
-        samples[sample_cnt].lun = ppa.g.fc;
-        samples[sample_cnt].pl = ppa.g.pl;
-        sample_cnt++;
+        samples[i].sublat = sublat;
         minlat = (sublat < minlat) ? sublat : minlat;
         sumlat += sublat;
         maxlat = (sublat > maxlat) ? sublat : maxlat;
@@ -382,18 +528,34 @@ static uint64_t zns_read(struct zns_ssd *zns, NvmeRequest *req)
          * 整条主机读取请求在 maxlat 时刻完成。任何 sublat < maxlat 的子操作
          * 都存在请求内部松弛时间，理论上可以被 Slacker 类调度器利用。
          */
-        uint64_t reqid = zns_read_slack_reqid++; //为这条读请求分配一个 reqid
         uint64_t total_slack = 0;
         uint64_t max_slack = 0;
+        uint64_t est_total_slack = 0;
+        uint64_t est_max_slack = 0;
+        uint64_t total_sublat_err = 0;
+        uint64_t total_slack_err = 0;
+        uint64_t reqid = zns_read_slack_reqid++; //为这条读请求分配一个 reqid
         uint64_t unique_planes = 0; //这条读请求覆盖了多少个不同的 flash plane
         uint64_t i, j;
 
         for (i = 0; i < sample_cnt; i++) { //遍历每个子请求
             uint64_t slack = maxlat - samples[i].sublat;
+            /*
+             * slack 是真实观测值；est_slack 是前面 shadow 模拟出来的估计值。
+             * 两者的误差用于判断 estimator 准不准。
+             */
+            uint64_t est_slack = samples[i].est_slack;
+            uint64_t sublat_err = zns_absdiff_u64(samples[i].est_sublat,
+                                                  samples[i].sublat);
+            uint64_t slack_err = zns_absdiff_u64(est_slack, slack);
             bool seen = false; //表示当前这个 plane 之前是否已经出现过
 
             total_slack += slack;
             max_slack = (slack > max_slack) ? slack : max_slack;
+            est_total_slack += est_slack;
+            est_max_slack = (est_slack > est_max_slack) ? est_slack : est_max_slack;
+            total_sublat_err += sublat_err;
+            total_slack_err += slack_err;
 
             for (j = 0; j < i; j++) {
                 if (samples[i].ch == samples[j].ch &&
@@ -415,6 +577,21 @@ static uint64_t zns_read(struct zns_ssd *zns, NvmeRequest *req)
                     "ch=%u,lun=%u,pl=%u,sublat_ns=%lu,slack_ns=%lu\n",
                     reqid, i, samples[i].lpn, samples[i].ch, samples[i].lun,
                     samples[i].pl, samples[i].sublat, slack);
+
+            /*
+             * 子操作级在线估计日志：
+             *   est_*：estimated，真实调度前用 shadow timeline 算出的估计值；
+             *   obs_*：observed，zns_advance_status() 真实执行后的观测值；
+             *   *_err：估计值和观测值的绝对误差。
+             */
+            ftl_log("ZNS_READ_SUBESTSLACK,reqid=%lu,subidx=%lu,lpn=%lu,"
+                    "ch=%u,lun=%u,pl=%u,est_start_ns=%lu,est_finish_ns=%lu,"
+                    "est_sublat_ns=%lu,est_slack_ns=%lu,obs_sublat_ns=%lu,"
+                    "obs_slack_ns=%lu,sublat_err_ns=%lu,slack_err_ns=%lu\n",
+                    reqid, i, samples[i].lpn, samples[i].ch, samples[i].lun,
+                    samples[i].pl, samples[i].est_start, samples[i].est_finish,
+                    samples[i].est_sublat, est_slack, samples[i].sublat,
+                    slack, sublat_err, slack_err);
         }
 
         /*
@@ -428,6 +605,25 @@ static uint64_t zns_read(struct zns_ssd *zns, NvmeRequest *req)
                 reqid, lba, nlb, sample_cnt, unique_planes, minlat, maxlat,
                 sumlat / sample_cnt, total_slack, total_slack / sample_cnt,
                 max_slack);
+
+        /*
+         * 请求级在线估计日志。
+         *
+         * 这行把一整条 host read 的估计结果和真实观测结果放在一起。
+         * 初版没有改变调度顺序，因此在当前 deterministic timing 模型下，
+         * maxlat_err_ns / avg_sublat_err_ns / avg_slack_err_ns 理论上应该很小。
+         */
+        ftl_log("ZNS_READ_ESTSLACK,reqid=%lu,slba=%lu,nlb=%u,subops=%lu,"
+                "unique_planes=%lu,est_minlat_ns=%lu,est_maxlat_ns=%lu,"
+                "est_avg_sublat_ns=%lu,est_total_slack_ns=%lu,"
+                "est_avg_slack_ns=%lu,est_max_slack_ns=%lu,"
+                "obs_maxlat_ns=%lu,obs_max_slack_ns=%lu,maxlat_err_ns=%lu,"
+                "avg_sublat_err_ns=%lu,avg_slack_err_ns=%lu\n",
+                reqid, lba, nlb, sample_cnt, unique_planes, est_minlat,
+                est_maxlat, est_sumlat / sample_cnt, est_total_slack,
+                est_total_slack / sample_cnt, est_max_slack, maxlat,
+                max_slack, zns_absdiff_u64(est_maxlat, maxlat),
+                total_sublat_err / sample_cnt, total_slack_err / sample_cnt);
     }
 
     g_free(samples);
