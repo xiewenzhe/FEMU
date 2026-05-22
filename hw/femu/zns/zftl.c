@@ -3,6 +3,7 @@
 //#define FEMU_DEBUG_ZFTL
 
 static void *ftl_thread(void *arg);
+static inline struct zns_plane *get_plane(struct zns_ssd *zns, struct ppa *ppa);
 
 /*
  * 一条 host read 会被拆成多个 NAND read 子请求。
@@ -17,12 +18,23 @@ static void *ftl_thread(void *arg);
 struct zns_read_slack_sample {
     uint64_t lpn;          /* 这个子请求对应的 4KiB 逻辑页号。 */
     struct ppa ppa;        /* LPN 查表得到的真实物理页地址。 */
-    uint64_t sublat;       /* 真实执行后观测到的子请求延迟。 */
+    uint64_t sublat;       /* 当前调度下真实返回给 host read 的子请求延迟。 */
     uint64_t read_delay;   /* 这个 NAND read 自身的服务时间。 */
     uint64_t est_start;    /* 估计的 NAND read 开始时间。 */
     uint64_t est_finish;   /* 估计的 NAND read 完成时间。 */
     uint64_t est_sublat;   /* 估计的子请求延迟：est_finish - req_stime。 */
     uint64_t est_slack;    /* 估计的 slack：est_maxlat - est_sublat。 */
+    uint64_t pred_critical_gap; /* est_maxlat - est_sublat，越小越接近关键路径。 */
+    uint64_t exec_start;   /* execute 原型真正安排的 NAND read 开始时间。 */
+    uint64_t exec_finish;  /* execute 原型真正安排的 NAND read 完成时间。 */
+    uint64_t exec_hops;    /* 当前子请求真正绕过了多少个 waiting read。 */
+    uint64_t exec_benefit; /* 相对 baseline est_finish 提前了多少时间。 */
+    uint64_t exec_consumed_victim_slack; /* 当前子请求绕过 victim 时消耗的 slack 总量。 */
+    uint64_t exec_blocked_by_pred_noncritical_slack; /* 被非关键绕行先消耗掉的 victim slack。 */
+    bool exec_candidate;   /* 当前子请求是否满足进入 bypass 判断的前置条件。 */
+    bool pred_critical;    /* 在线估计认为它是否接近当前 host read 的关键路径。 */
+    bool exec_reject_slack_insufficient; /* 扫描时是否因 victim slack 不足而停止。 */
+    bool exec_reject_after_pred_noncritical; /* slack 不足前，victim 是否被预测非关键请求消耗过。 */
     uint16_t ch;           /* 目标 channel。 */
     uint16_t lun;          /* 目标 LUN/chip。 */
     uint16_t pl;           /* 目标 plane。 */
@@ -43,15 +55,15 @@ struct zns_read_shadow_plane {
 };
 
 /*
- * dry-run 队列中的一个 read 子请求。
+ * read bypass 队列中的一个 read 子请求。
  *
- * 这不是新的真实调度队列，只是为了分析 read bypass 机会而保存的 baseline
- * 队列快照。每个字段的含义如下：
+ * dry-run 阶段它只是 baseline 队列快照；进入 execute 原型后，它表示当前
+ * plane 上“已经安排、但还没有开始”的 read 队列。每个字段的含义如下：
  *   reqid/subidx/lpn：唯一定位这个 read 子请求来自哪条 host read、哪一个子请求；
  *   req_stime：它所属 host read 到达 FTL 的时间；
- *   start/finish：baseline 顺序下，这个子请求在目标 plane 的开始/结束时间；
- *   deadline：它所属 host read 在 baseline 下的完成时间；
- *   slack：这个子请求在 baseline 下还能容忍多少额外延迟；
+ *   start/finish：当前 read 队列顺序下，这个子请求在目标 plane 的开始/结束时间；
+ *   deadline：它所属 host read 已经承诺给主机的完成时间；
+ *   slack：在不超过 deadline 的前提下，这个子请求当前还能容忍多少额外延迟；
  *   read_delay：这个子请求本身占用 plane 的服务时间；
  *   ch/lun/pl：它落到哪个内部 plane，主要用于日志核对。
  */
@@ -65,6 +77,13 @@ struct zns_read_bypass_entry {
     uint64_t finish;
     uint64_t deadline;
     uint64_t slack;
+    /*
+     * 诊断字段：记录这个 victim 的 slack 曾经被谁消耗过。
+     * 后续如果一个 predicted-critical read 因 slack 不足被挡住，
+     * 就能判断是不是之前 predicted-noncritical read 先吃掉了 slack。
+     */
+    uint64_t slack_consumed_by_pred_critical;
+    uint64_t slack_consumed_by_pred_noncritical;
     uint64_t read_delay;
     uint16_t ch;
     uint16_t lun;
@@ -72,13 +91,13 @@ struct zns_read_bypass_entry {
 };
 
 /*
- * 每个 plane 对应一个 dry-run read 队列。
+ * 每个 plane 对应一个 read bypass 队列。
  *
- * entries 按 baseline 服务顺序保存仍未开始的 read 子请求：
+ * entries 按当前服务顺序保存仍未开始的 read 子请求：
  *   entries[0]      是离队头最近、最早会被服务的 waiting read；
  *   entries[len-1]  是队尾，也是新 read 做 Slacker 式前移时首先检查的对象。
  */
-//每个 plane 自己的 dry-run read 队列
+//每个 plane 自己的 read bypass 队列
 struct zns_read_bypass_queue {
     struct zns_read_bypass_entry *entries;
     uint64_t len;
@@ -94,10 +113,93 @@ struct zns_read_bypass_queue {
 /* 只用于把多行子操作日志关联到同一条主机读取请求。 */
 static uint64_t zns_read_slack_reqid;
 static struct zns_read_bypass_queue zns_read_bypass_queues[ZNS_BYPASS_MAX_PLANES];
+static bool zns_read_bypass_exec_flag_loaded;
+static bool zns_read_bypass_exec_flag;
+static bool zns_read_bypass_critical_only_flag_loaded;
+static bool zns_read_bypass_critical_only_flag;
+static bool zns_read_bypass_critical_reserve_flag_loaded;
+static bool zns_read_bypass_critical_reserve_flag;
 
 static inline uint64_t zns_absdiff_u64(uint64_t a, uint64_t b)
 {
     return (a > b) ? (a - b) : (b - a);
+}
+
+/*
+ * 用环境变量切换 baseline / execute，便于同一份代码做干净对照：
+ *   unset 或 0：保留 baseline read 调度，只输出 dry-run 机会分析；
+ *   1/true/on：真正执行 read-read bypass。
+ */
+static bool zns_read_bypass_exec_enabled(void)
+{
+    const char *value;
+
+    if (!zns_read_bypass_exec_flag_loaded) {
+        value = g_getenv("FEMU_ZNS_READ_BYPASS_EXEC");
+        zns_read_bypass_exec_flag =
+            value &&
+            (!g_ascii_strcasecmp(value, "1") ||
+             !g_ascii_strcasecmp(value, "true") ||
+             !g_ascii_strcasecmp(value, "on"));
+        zns_read_bypass_exec_flag_loaded = true;
+    }
+
+    return zns_read_bypass_exec_flag;
+}
+
+/*
+ * critical-only 原型开关：
+ *   unset 或 0：保持 naive execute，所有满足 slack 条件的 read subop 都可尝试绕行；
+ *   1/true/on：只有在线估计为 predicted-critical 的 read subop 才允许真正绕行。
+ *
+ * 注意：非 critical subop 仍会被标记为 candidate，便于实验中统计“原本有多少
+ * naive 机会被 critical-only 策略挡住”。
+ */
+static bool zns_read_bypass_critical_only_enabled(void)
+{
+    const char *value;
+
+    if (!zns_read_bypass_critical_only_flag_loaded) {
+        value = g_getenv("FEMU_ZNS_READ_BYPASS_CRITICAL_ONLY");
+        zns_read_bypass_critical_only_flag =
+            value &&
+            (!g_ascii_strcasecmp(value, "1") ||
+             !g_ascii_strcasecmp(value, "true") ||
+             !g_ascii_strcasecmp(value, "on"));
+        zns_read_bypass_critical_only_flag_loaded = true;
+    }
+
+    return zns_read_bypass_critical_only_flag;
+}
+
+/*
+ * near-critical first + slack reserve 原型开关：
+ *   unset 或 0：不保留额外 slack，维持当前 execute 策略；
+ *   1/true/on：predicted-noncritical 只有在 victim 被后移后仍至少剩下
+ *              一个 read_delay slack 时才允许绕过。
+ *
+ * 换句话说：
+ *   - predicted-critical:    victim_slack >= read_delay 即可绕过；
+ *   - predicted-noncritical: victim_slack >= 2 * read_delay 才可绕过。
+ *
+ * 这样 noncritical 不是完全禁止，而是在不吃掉 critical reserve 的前提下
+ * 才能利用 slack。
+ */
+static bool zns_read_bypass_critical_reserve_enabled(void)
+{
+    const char *value;
+
+    if (!zns_read_bypass_critical_reserve_flag_loaded) {
+        value = g_getenv("FEMU_ZNS_READ_BYPASS_CRITICAL_RESERVE");
+        zns_read_bypass_critical_reserve_flag =
+            value &&
+            (!g_ascii_strcasecmp(value, "1") ||
+             !g_ascii_strcasecmp(value, "true") ||
+             !g_ascii_strcasecmp(value, "on"));
+        zns_read_bypass_critical_reserve_flag_loaded = true;
+    }
+
+    return zns_read_bypass_critical_reserve_flag;
 }
 
 /* 在当前 host read 的 shadow plane 表里查找某个 PPA 对应的 plane。 */
@@ -142,7 +244,7 @@ static struct zns_read_bypass_queue *zns_read_bypass_get_queue(struct ppa *ppa)
         return NULL;
     }
 
-    //下标合法返回这个 PPA 所属 plane 的 dry-run read 队列
+    //下标合法返回这个 PPA 所属 plane 的 read bypass 队列
     return &zns_read_bypass_queues[idx];
 }
 
@@ -182,9 +284,8 @@ static void zns_read_bypass_prune_started(struct zns_read_bypass_queue *queue,
     queue->len -= drop;
 }
 
-//往队列尾部加入一个 read entry
-static void zns_read_bypass_queue_push(struct zns_read_bypass_queue *queue,
-                                       struct zns_read_bypass_entry *entry)
+//确保队列至少还能多放一个 read entry
+static void zns_read_bypass_queue_reserve_one(struct zns_read_bypass_queue *queue)
 {
     if (queue->len == queue->cap) {
         uint64_t new_cap = queue->cap ? queue->cap * 2 : 8;
@@ -193,37 +294,106 @@ static void zns_read_bypass_queue_push(struct zns_read_bypass_queue *queue,
                                    sizeof(*queue->entries) * new_cap);
         queue->cap = new_cap;
     }
+}
 
+//往队列尾部加入一个 read entry
+static void zns_read_bypass_queue_push(struct zns_read_bypass_queue *queue,
+                                       struct zns_read_bypass_entry *entry)
+{
+    zns_read_bypass_queue_reserve_one(queue);
     queue->entries[queue->len++] = *entry;
 }
 
-//把一个真实 read 子请求记录到 dry-run 队列
-static void zns_read_bypass_remember_read(uint64_t reqid, uint64_t subidx,
-                                          struct zns_read_slack_sample *sample,
-                                          uint64_t read_stime,
-                                          uint64_t req_maxlat)
+//构造一个可放入 bypass 队列的 read entry。
+static struct zns_read_bypass_entry zns_read_bypass_make_entry(
+    uint64_t reqid, uint64_t subidx, struct zns_read_slack_sample *sample,
+    uint64_t read_stime, uint64_t deadline, uint64_t start, uint64_t finish)
+{
+    struct zns_read_bypass_entry entry;
+
+    entry.reqid = reqid;
+    entry.subidx = subidx;
+    entry.lpn = sample->lpn;
+    entry.req_stime = read_stime;
+    entry.start = start;
+    entry.finish = finish;
+    entry.deadline = deadline;
+    entry.slack = (entry.deadline > entry.finish) ?
+        (entry.deadline - entry.finish) : 0;
+    entry.slack_consumed_by_pred_critical = 0;
+    entry.slack_consumed_by_pred_noncritical = 0;
+    entry.read_delay = sample->read_delay;
+    entry.ch = sample->ch;
+    entry.lun = sample->lun;
+    entry.pl = sample->pl;
+
+    return entry;
+}
+
+/*
+ * execute 模式里，当前 host read 的真实完成时间要等它所有子请求都安排完
+ * 才能知道。因此刚把 entry 插入队列时，只能先写一个临时 deadline。
+ *
+ * 由于 FTL 线程串行处理 host request，下一条 host read 到来前，当前请求一定
+ * 已经走到这里。我们在返回给上层之前，把当前请求所有 queued subop 的
+ * deadline 统一改成“真正会写入 req->expire_time 的 host completion”。
+ *
+ * 这个动作非常关键：后续 read 只能消耗 victim 在这个 deadline 之前的 slack。
+ * 只要不把 victim 推过 deadline，它所属旧 host request 的 expire_time 就不需要
+ * 被回头修改，主机看到的完成时间仍然正确。
+ */
+static void zns_read_bypass_finalize_deadline(uint64_t reqid,
+                                              struct zns_read_slack_sample *samples,
+                                              uint64_t sample_cnt,
+                                              uint64_t read_stime,
+                                              uint64_t req_maxlat)
+{
+    uint64_t deadline = read_stime + req_maxlat;
+    uint64_t i;
+
+    for (i = 0; i < sample_cnt; i++) {
+        struct zns_read_bypass_queue *queue =
+            zns_read_bypass_get_queue(&samples[i].ppa);
+        uint64_t pos;
+
+        if (!queue) {
+            continue;
+        }
+
+        for (pos = 0; pos < queue->len; pos++) {
+            struct zns_read_bypass_entry *entry = &queue->entries[pos];
+
+            if (entry->reqid == reqid && entry->subidx == i) {
+                entry->deadline = deadline;
+                entry->slack = (deadline > entry->finish) ?
+                    (deadline - entry->finish) : 0;
+                break;
+            }
+        }
+    }
+}
+
+//把一个 baseline read 子请求记录到队列，供后续 dry-run 使用。
+static void zns_read_bypass_remember_baseline_read(
+    uint64_t reqid, uint64_t subidx, struct zns_read_slack_sample *sample,
+    uint64_t read_stime, uint64_t req_maxlat)
 {
     struct zns_read_bypass_queue *queue =
         zns_read_bypass_get_queue(&sample->ppa);
+    uint64_t finish;
+    uint64_t start;
+    uint64_t deadline;
     struct zns_read_bypass_entry entry;
 
     if (!queue) {
         return;
     }
 
-    entry.reqid = reqid;
-    entry.subidx = subidx;
-    entry.lpn = sample->lpn;
-    entry.req_stime = read_stime;
-    entry.finish = read_stime + sample->sublat;
-    entry.start = entry.finish - sample->read_delay;
-    entry.deadline = read_stime + req_maxlat;
-    entry.slack = entry.deadline - entry.finish;
-    entry.read_delay = sample->read_delay;
-    entry.ch = sample->ch;
-    entry.lun = sample->lun;
-    entry.pl = sample->pl;
-
+    finish = read_stime + sample->sublat;
+    start = finish - sample->read_delay;
+    deadline = read_stime + req_maxlat;
+    entry = zns_read_bypass_make_entry(reqid, subidx, sample, read_stime,
+                                       deadline, start, finish);
     zns_read_bypass_queue_push(queue, &entry);
 }
 
@@ -354,6 +524,227 @@ static void zns_read_bypass_dryrun(uint64_t reqid,
                 reqid, sample_cnt, candidate_subops, bypassable_subops,
                 total_hops, max_hops, total_benefit, max_benefit);
     }
+}
+
+/*
+ * 真正执行 read-read bypass。
+ *
+ * 当前 plane 队列只保存“已经安排、但还没有开始”的 read。incoming read
+ * 默认会接在队尾；如果队尾开始向前的一段 waiting read 都有足够 slack，
+ * 就把 incoming read 插到它们前面，并把被跨过的 victim 各自后移一个
+ * incoming read 的服务时间。
+ *
+ * 这版原型仍然保持保守：
+ *   1. 只允许 read 绕过 read；
+ *   2. 不跨过同一条 host read 内更早的子请求，避免在一个请求内部再重排；
+ *   3. 不跨过 write/erase，非 read 到来时队列会被清空；
+ *   4. 每个 victim 被后移后都必须仍然不晚于它所属 host read 已经承诺的
+ *      completion deadline。只要这个不变量成立，victim 的 host request
+ *      expire_time 就无需回头修改。
+ *
+ * 注意：entry 插入时的 req_deadline 只是当前请求的临时 deadline；等当前
+ * host read 的真实 maxlat 算出后，zns_read_bypass_finalize_deadline() 会在
+ * zns_read() 返回前把它收紧成真正承诺给主机的 completion time。
+ */
+static uint64_t zns_read_bypass_execute(uint64_t reqid, uint64_t subidx,
+                                        struct zns_ssd *zns,
+                                        struct zns_read_slack_sample *sample,
+                                        uint64_t read_stime,
+                                        uint64_t req_deadline)
+{
+    struct zns_read_bypass_queue *queue =
+        zns_read_bypass_get_queue(&sample->ppa);
+    struct zns_plane *pl = get_plane(zns, &sample->ppa);
+    struct zns_read_bypass_entry entry;
+    uint64_t old_avail = pl->next_plane_avail_time;
+    uint64_t baseline_start = (old_avail < read_stime) ? read_stime : old_avail;
+    uint64_t baseline_finish = baseline_start + sample->read_delay;
+    uint64_t start = baseline_start;
+    uint64_t finish = baseline_finish;
+    uint64_t hops = 0;
+    uint64_t insertion_pos = 0;
+    uint64_t pos;
+    bool critical_only = zns_read_bypass_critical_only_enabled();
+    bool critical_reserve = zns_read_bypass_critical_reserve_enabled();
+
+    if (!queue) {
+        /*
+         * 理论上合法 PPA 都应能映射到队列；如果映射失败，就退化成普通
+         * baseline read，保证功能正确。
+         */
+        sample->exec_start = baseline_start;
+        sample->exec_finish = baseline_finish;
+        sample->exec_hops = 0;
+        sample->exec_benefit = 0;
+        sample->exec_candidate = false;
+        pl->next_plane_avail_time = baseline_finish;
+        return baseline_finish - read_stime;
+    }
+
+    zns_read_bypass_prune_started(queue, read_stime);
+
+    /*
+     * 只有队尾 read 与当前 read 在时间线上连续，且它来自更早的 host read，
+     * incoming read 才算 candidate。这样既避免跨过空档/非 read，也避免把
+     * 同一条 host read 内本来就禁止互相绕行的 sibling subop 误计为候选。
+     */
+    if (queue->len &&
+        queue->entries[queue->len - 1].finish == baseline_start &&
+        queue->entries[queue->len - 1].reqid != reqid) {
+        sample->exec_candidate = true;
+
+        /*
+         * t3 critical-only 策略：非 predicted-critical subop 只记录为
+         * candidate，不真正前移。这样可以和 t2 naive execute 对比：
+         *   - candidate_subops 仍表示原始连续队列机会；
+         *   - executed_subops 表示 critical-only 策略实际放行的机会。
+         */
+        if (critical_only && !sample->pred_critical) {
+            goto skip_bypass_scan;
+        }
+
+        /*
+         * 从队尾向队头扫描。只要 victim 仍有足够 slack，就继续前移。
+         * 如果遇到同一条 host read 内更早的子请求，也停止，避免 sibling
+         * subop 在 execute 原型里互相穿插。
+         */
+        for (pos = queue->len; pos > 0; pos--) {
+            struct zns_read_bypass_entry *victim = &queue->entries[pos - 1];
+            uint64_t required_slack = sample->read_delay;
+
+            if (victim->reqid == reqid) {
+                break;
+            }
+
+            /*
+             * t4 near-critical first + reserve 策略：
+             * predicted-critical 只需要保证 victim 不超过 deadline；
+             * predicted-noncritical 还必须给后续可能到来的 critical read
+             * 预留至少一个 read_delay 的 residual slack。
+             */
+            if (critical_reserve && !sample->pred_critical) {
+                required_slack += sample->read_delay;
+            }
+
+            if (victim->slack < required_slack) {
+                sample->exec_reject_slack_insufficient = true;
+                if (sample->pred_critical &&
+                    victim->slack_consumed_by_pred_noncritical) {
+                    sample->exec_reject_after_pred_noncritical = true;
+                    sample->exec_blocked_by_pred_noncritical_slack =
+                        victim->slack_consumed_by_pred_noncritical;
+                }
+                break;
+            }
+
+            hops++;
+        }
+    }
+
+skip_bypass_scan:
+    if (hops) {
+        uint64_t queue_len_before = queue->len;
+
+        insertion_pos = queue->len - hops;
+        start = queue->entries[insertion_pos].start;
+        finish = start + sample->read_delay;
+
+        zns_read_bypass_queue_reserve_one(queue);
+
+        /*
+         * 从队尾向后搬移被跨过的 victim。每个 victim 都被 incoming read
+         * 多占用的一个 read slot 推迟一次，因此扣掉同样长度的 residual slack。
+         */
+        for (pos = queue->len; pos > insertion_pos; pos--) {
+            struct zns_read_bypass_entry victim = queue->entries[pos - 1];
+            uint64_t old_start = victim.start;
+            uint64_t old_finish = victim.finish;
+            uint64_t old_slack = victim.slack;
+
+            victim.start += sample->read_delay;
+            victim.finish += sample->read_delay;
+            victim.slack -= sample->read_delay;
+            if (sample->pred_critical) {
+                victim.slack_consumed_by_pred_critical += sample->read_delay;
+            } else {
+                victim.slack_consumed_by_pred_noncritical += sample->read_delay;
+            }
+            sample->exec_consumed_victim_slack += sample->read_delay;
+            queue->entries[pos] = victim;
+
+            ftl_log("ZNS_READ_BYPASS_EXEC_HOP,reqid=%lu,subidx=%lu,lpn=%lu,"
+                    "ch=%u,lun=%u,pl=%u,hop=%lu,victim_reqid=%lu,"
+                    "victim_subidx=%lu,victim_lpn=%lu,victim_old_start_ns=%lu,"
+                    "victim_old_finish_ns=%lu,victim_new_start_ns=%lu,"
+                    "victim_new_finish_ns=%lu,victim_deadline_ns=%lu,"
+                    "victim_old_slack_ns=%lu,victim_new_slack_ns=%lu,"
+                    "slack_used_ns=%lu,incoming_pred_critical=%u,"
+                    "victim_consumed_by_pred_critical_ns=%lu,"
+                    "victim_consumed_by_pred_noncritical_ns=%lu\n",
+                    reqid, subidx, sample->lpn, sample->ch, sample->lun,
+                    sample->pl, queue->len - pos + 1, victim.reqid,
+                    victim.subidx, victim.lpn, old_start, old_finish,
+                    victim.start, victim.finish, victim.deadline, old_slack,
+                    victim.slack, sample->read_delay,
+                    sample->pred_critical ? 1 : 0,
+                    victim.slack_consumed_by_pred_critical,
+                    victim.slack_consumed_by_pred_noncritical);
+        }
+
+        entry = zns_read_bypass_make_entry(reqid, subidx, sample, read_stime,
+                                           req_deadline, start, finish);
+        queue->entries[insertion_pos] = entry;
+        queue->len++;
+
+        sample->exec_hops = hops;
+        sample->exec_benefit =
+            (baseline_finish > finish) ? (baseline_finish - finish) : 0;
+
+        ftl_log("ZNS_READ_BYPASS_EXEC,reqid=%lu,subidx=%lu,lpn=%lu,"
+                "ch=%u,lun=%u,pl=%u,queue_len_before=%lu,hops=%lu,"
+                "baseline_start_ns=%lu,baseline_finish_ns=%lu,"
+                "exec_start_ns=%lu,exec_finish_ns=%lu,benefit_ns=%lu,"
+                "pred_critical=%u,pred_critical_gap_ns=%lu,"
+                "consumed_victim_slack_ns=%lu\n",
+                reqid, subidx, sample->lpn, sample->ch, sample->lun,
+                sample->pl, queue_len_before, hops, baseline_start,
+                baseline_finish, start, finish, sample->exec_benefit,
+                sample->pred_critical ? 1 : 0,
+                sample->pred_critical_gap,
+                sample->exec_consumed_victim_slack);
+    } else {
+        /*
+         * 没有可绕行 victim，就按当前真实时间线接到队尾。
+         */
+        entry = zns_read_bypass_make_entry(reqid, subidx, sample, read_stime,
+                                           req_deadline, start, finish);
+        zns_read_bypass_queue_push(queue, &entry);
+        sample->exec_hops = 0;
+        sample->exec_benefit = 0;
+    }
+
+    sample->exec_start = start;
+    sample->exec_finish = finish;
+
+    /*
+     * 队尾 finish 就是当前 plane 在 execute 调度下真正的下一次空闲时间。
+     */
+    pl->next_plane_avail_time = queue->entries[queue->len - 1].finish;
+
+    /*
+     * 保留原有 [PU] 日志形式，方便继续观察 plane 占用。若之后发生 bypass，
+     * 被后移 victim 的修正会额外体现在 ZNS_READ_BYPASS_EXEC_HOP 中。
+     */
+    femu_log("[PU] cmd=READ req=%lu old_avail=%lu start=%lu finish=%lu delay=%lu "
+             "lat=%lu wait=%lu idle=%lu ch=%u lun=%u pl=%u blk=%u pg=%u spg=%u\n",
+             read_stime, old_avail, start, finish, sample->read_delay,
+             finish - read_stime,
+             (start > read_stime) ? (start - read_stime) : 0,
+             (read_stime > old_avail) ? (read_stime - old_avail) : 0,
+             sample->ppa.g.ch, sample->ppa.g.fc, sample->ppa.g.pl,
+             sample->ppa.g.blk, sample->ppa.g.pg, sample->ppa.g.spg);
+
+    return finish - read_stime;
 }
 
 /*
@@ -491,8 +882,8 @@ static uint64_t zns_advance_status(struct zns_ssd *zns, struct ppa *ppa,struct n
     const char *cmd_name = "UNKNOWN";
 
     /*
-     * 当前 dry-run 只讨论 read 绕过 read。
-     * 某个 plane 一旦出现 write/erase，就把它的 dry-run read 队列清空，
+     * 当前 bypass 原型只讨论 read 绕过 read。
+     * 某个 plane 一旦出现 write/erase，就把它的 read bypass 队列清空，
      * 保守地避免后续 read 跨过这些非读操作。
      */
     if (ncmd->cmd != NAND_READ) {
@@ -683,6 +1074,7 @@ static uint64_t zns_read(struct zns_ssd *zns, NvmeRequest *req)
     uint64_t minlat = ~0ULL; //表示一个 uint64_t 能表示的最大值
     uint64_t sumlat = 0; 
     uint64_t reqid = 0;
+    bool exec_enabled = zns_read_bypass_exec_enabled();
     struct zns_read_slack_sample *samples;
 
     samples = g_malloc0(sizeof(*samples) * nr_lpn);
@@ -788,8 +1180,16 @@ static uint64_t zns_read(struct zns_ssd *zns, NvmeRequest *req)
             /*
              * host read 的完成时间由最慢的子请求决定。
              * 子请求估计 slack = 估计最慢延迟 - 当前子请求估计延迟。
+             *
+             * pred_critical 是在线可见的“预测关键路径”标签：
+             * 如果某个 subop 距离估计 maxlat 不超过一个 NAND read_delay，
+             * 就认为它接近关键路径。后续诊断会检查这个预测是否真的命中
+             * baseline/execute 的关键 subop。
              */
             samples[i].est_slack = est_maxlat - samples[i].est_sublat;
+            samples[i].pred_critical_gap = est_maxlat - samples[i].est_sublat;
+            samples[i].pred_critical =
+                samples[i].pred_critical_gap <= samples[i].read_delay;
         }
 
         g_free(shadow_planes);
@@ -804,30 +1204,30 @@ static uint64_t zns_read(struct zns_ssd *zns, NvmeRequest *req)
     }
 
     /*
-     * 第三步：按原来的方式真实发起 NAND_READ。
+     * 第三步：根据运行模式选择真实调度路径。
      *
-     * 前面的估计只碰 shadow，所以这里仍然由 zns_advance_status() 推进真实
-     * plane 时间线，并返回真实观测到的 sublat。也就是说，本次改动只增加
-     * 估计和日志，不改变 read 请求的真实完成时间。
+     * baseline 模式继续走原来的 zns_advance_status()；
+     * execute 模式则真正使用 read-read bypass 队列调度。
      */
     for (uint64_t i = 0; i < sample_cnt; i++) {
         ppa = samples[i].ppa;
+        if (exec_enabled) {
+            /*
+             * est_maxlat 是“不做当前 read 绕行时”的 baseline host 完成时间。
+             * execute 原型可以让 incoming read 更早完成，但前序 victim 最晚
+             * 只能被推迟到各自原本的 baseline deadline。
+             */
+            sublat = zns_read_bypass_execute(reqid, i, zns, &samples[i],
+                                             read_stime,
+                                             read_stime + est_maxlat);
+        } else {
+            struct nand_cmd srd;
 
-        /*
-         * 为当前 LPN 构造一个 NAND page read 子命令。
-         * USER_IO 表示这是前台主机 I/O，不是 GC 或后台任务。
-         */
-        struct nand_cmd srd;
-        srd.type = USER_IO;
-        srd.cmd = NAND_READ;
-
-        /*
-         * 同一条 NVMe 请求内的所有子读都使用 req->stime 作为到达时间。
-         * 如果它们落到不同 plane，就可以在模型里并行推进。
-         */
-        srd.stime = read_stime;
-
-        sublat = zns_advance_status(zns, &ppa, &srd);
+            srd.type = USER_IO;
+            srd.cmd = NAND_READ;
+            srd.stime = read_stime;
+            sublat = zns_advance_status(zns, &ppa, &srd);
+        }
         femu_log("[R] lpn:\t%lu\t<--ch:\t%u\tlun:\t%u\tpl:\t%u\tblk:\t%u\tpg:\t%u\tsubpg:\t%u\tlat\t%lu\n",samples[i].lpn,ppa.g.ch,ppa.g.fc,ppa.g.pl,ppa.g.blk,ppa.g.pg,ppa.g.spg,sublat);
 
         /*
@@ -851,6 +1251,30 @@ static uint64_t zns_read(struct zns_ssd *zns, NvmeRequest *req)
         uint64_t est_max_slack = 0;
         uint64_t total_sublat_err = 0;
         uint64_t total_slack_err = 0;
+        uint64_t exec_candidate_subops = 0;
+        uint64_t exec_bypass_subops = 0;
+        uint64_t exec_total_hops = 0;
+        uint64_t exec_max_hops = 0;
+        uint64_t exec_total_benefit = 0;
+        uint64_t exec_max_benefit = 0;
+        uint64_t exec_baseline_maxlat_subops = 0;
+        uint64_t exec_bypass_critical_subops = 0;
+        uint64_t exec_host_improvement = 0;
+        uint64_t pred_critical_subops = 0;
+        uint64_t true_baseline_critical_subops = 0;
+        uint64_t pred_true_baseline_critical_subops = 0;
+        uint64_t obs_critical_subops = 0;
+        uint64_t pred_obs_critical_subops = 0;
+        uint64_t pred_critical_candidate_subops = 0;
+        uint64_t pred_noncritical_candidate_subops = 0;
+        uint64_t pred_critical_executed_subops = 0;
+        uint64_t pred_noncritical_executed_subops = 0;
+        uint64_t pred_critical_consumed_slack = 0;
+        uint64_t pred_noncritical_consumed_slack = 0;
+        uint64_t pred_critical_reject_slack_insufficient = 0;
+        uint64_t pred_noncritical_reject_slack_insufficient = 0;
+        uint64_t pred_critical_reject_after_noncritical = 0;
+        uint64_t pred_critical_blocked_by_noncritical_slack = 0;
         uint64_t unique_planes = 0; //这条读请求覆盖了多少个不同的 flash plane
         uint64_t i, j;
 
@@ -864,6 +1288,8 @@ static uint64_t zns_read(struct zns_ssd *zns, NvmeRequest *req)
             uint64_t sublat_err = zns_absdiff_u64(samples[i].est_sublat,
                                                   samples[i].sublat);
             uint64_t slack_err = zns_absdiff_u64(est_slack, slack);
+            bool true_baseline_critical = samples[i].est_sublat == est_maxlat;
+            bool obs_critical = samples[i].sublat == maxlat;
             bool seen = false; //表示当前这个 plane 之前是否已经出现过
 
             total_slack += slack;
@@ -872,6 +1298,58 @@ static uint64_t zns_read(struct zns_ssd *zns, NvmeRequest *req)
             est_max_slack = (est_slack > est_max_slack) ? est_slack : est_max_slack;
             total_sublat_err += sublat_err;
             total_slack_err += slack_err;
+            pred_critical_subops += samples[i].pred_critical ? 1 : 0;
+            true_baseline_critical_subops += true_baseline_critical ? 1 : 0;
+            pred_true_baseline_critical_subops +=
+                (samples[i].pred_critical && true_baseline_critical) ? 1 : 0;
+            obs_critical_subops += obs_critical ? 1 : 0;
+            pred_obs_critical_subops +=
+                (samples[i].pred_critical && obs_critical) ? 1 : 0;
+            exec_candidate_subops += samples[i].exec_candidate ? 1 : 0;
+            if (samples[i].exec_candidate) {
+                if (samples[i].pred_critical) {
+                    pred_critical_candidate_subops++;
+                } else {
+                    pred_noncritical_candidate_subops++;
+                }
+            }
+            if (true_baseline_critical) {
+                exec_baseline_maxlat_subops++;
+            }
+            if (samples[i].exec_hops) {
+                exec_bypass_subops++;
+                if (true_baseline_critical) {
+                    exec_bypass_critical_subops++;
+                }
+                if (samples[i].pred_critical) {
+                    pred_critical_executed_subops++;
+                    pred_critical_consumed_slack +=
+                        samples[i].exec_consumed_victim_slack;
+                } else {
+                    pred_noncritical_executed_subops++;
+                    pred_noncritical_consumed_slack +=
+                        samples[i].exec_consumed_victim_slack;
+                }
+                exec_total_hops += samples[i].exec_hops;
+                exec_max_hops = (samples[i].exec_hops > exec_max_hops) ?
+                    samples[i].exec_hops : exec_max_hops;
+                exec_total_benefit += samples[i].exec_benefit;
+                exec_max_benefit =
+                    (samples[i].exec_benefit > exec_max_benefit) ?
+                    samples[i].exec_benefit : exec_max_benefit;
+            }
+            if (samples[i].exec_reject_slack_insufficient) {
+                if (samples[i].pred_critical) {
+                    pred_critical_reject_slack_insufficient++;
+                } else {
+                    pred_noncritical_reject_slack_insufficient++;
+                }
+            }
+            if (samples[i].exec_reject_after_pred_noncritical) {
+                pred_critical_reject_after_noncritical++;
+                pred_critical_blocked_by_noncritical_slack +=
+                    samples[i].exec_blocked_by_pred_noncritical_slack;
+            }
 
             for (j = 0; j < i; j++) {
                 if (samples[i].ch == samples[j].ch &&
@@ -909,12 +1387,69 @@ static uint64_t zns_read(struct zns_ssd *zns, NvmeRequest *req)
                     samples[i].est_sublat, est_slack, samples[i].sublat,
                     slack, sublat_err, slack_err);
 
+        }
+
+        exec_host_improvement = (est_maxlat > maxlat) ?
+            (est_maxlat - maxlat) : 0;
+
+        if (exec_enabled && exec_candidate_subops) {
+            ftl_log("ZNS_READ_BYPASS_EXEC_SUMMARY,reqid=%lu,subops=%lu,"
+                    "candidate_subops=%lu,bypass_subops=%lu,total_hops=%lu,"
+                    "max_hops=%lu,total_benefit_ns=%lu,max_benefit_ns=%lu,"
+                    "baseline_maxlat_subops=%lu,bypass_critical_subops=%lu,"
+                    "baseline_maxlat_ns=%lu,exec_maxlat_ns=%lu,"
+                    "host_improved=%u,host_improvement_ns=%lu,"
+                    "pred_critical_subops=%lu,true_baseline_critical_subops=%lu,"
+                    "pred_true_baseline_critical_subops=%lu,"
+                    "obs_critical_subops=%lu,pred_obs_critical_subops=%lu,"
+                    "pred_critical_candidate_subops=%lu,"
+                    "pred_noncritical_candidate_subops=%lu,"
+                    "pred_critical_executed_subops=%lu,"
+                    "pred_noncritical_executed_subops=%lu,"
+                    "pred_critical_consumed_slack_ns=%lu,"
+                    "pred_noncritical_consumed_slack_ns=%lu,"
+                    "pred_critical_reject_slack_insufficient=%lu,"
+                    "pred_noncritical_reject_slack_insufficient=%lu,"
+                    "pred_critical_reject_after_noncritical=%lu,"
+                    "pred_critical_blocked_by_noncritical_slack_ns=%lu\n",
+                    reqid, sample_cnt, exec_candidate_subops,
+                    exec_bypass_subops, exec_total_hops, exec_max_hops,
+                    exec_total_benefit, exec_max_benefit,
+                    exec_baseline_maxlat_subops, exec_bypass_critical_subops,
+                    est_maxlat, maxlat, exec_host_improvement ? 1 : 0,
+                    exec_host_improvement, pred_critical_subops,
+                    true_baseline_critical_subops,
+                    pred_true_baseline_critical_subops,
+                    obs_critical_subops, pred_obs_critical_subops,
+                    pred_critical_candidate_subops,
+                    pred_noncritical_candidate_subops,
+                    pred_critical_executed_subops,
+                    pred_noncritical_executed_subops,
+                    pred_critical_consumed_slack,
+                    pred_noncritical_consumed_slack,
+                    pred_critical_reject_slack_insufficient,
+                    pred_noncritical_reject_slack_insufficient,
+                    pred_critical_reject_after_noncritical,
+                    pred_critical_blocked_by_noncritical_slack);
+        }
+
+        if (!exec_enabled) {
             /*
-             * 把当前 read 子请求按 baseline 顺序放入对应 plane 的 dry-run
-             * 队列，供后续 host read 从队尾向前扫描。这里只记录，不重排。
+             * baseline 模式下，真实 read 已经走完原始调度，再把当前 read
+             * 记入队列，继续支持后续请求的 dry-run opportunity analysis。
              */
-            zns_read_bypass_remember_read(reqid, i, &samples[i],
-                                          read_stime, maxlat);
+            for (i = 0; i < sample_cnt; i++) {
+                zns_read_bypass_remember_baseline_read(reqid, i, &samples[i],
+                                                       read_stime, maxlat);
+            }
+        } else {
+            /*
+             * execute 模式下，当前请求刚排入队列时只拿到了临时 deadline。
+             * 现在 maxlat 已经确定，必须在 zns_read() 返回前把当前请求所有
+             * entry 的 deadline 收紧成真正会承诺给 host 的完成时间。
+             */
+            zns_read_bypass_finalize_deadline(reqid, samples, sample_cnt,
+                                              read_stime, maxlat);
         }
 
         /*
@@ -932,9 +1467,9 @@ static uint64_t zns_read(struct zns_ssd *zns, NvmeRequest *req)
         /*
          * 请求级在线估计日志。
          *
-         * 这行把一整条 host read 的估计结果和真实观测结果放在一起。
-         * 初版没有改变调度顺序，因此在当前 deterministic timing 模型下，
-         * maxlat_err_ns / avg_sublat_err_ns / avg_slack_err_ns 理论上应该很小。
+         * 这行把一整条 host read 的 baseline 估计结果和当前 execute 调度
+         * 结果放在一起。进入 bypass execute 后，*_err 字段不再只表示
+         * estimator 误差，也会包含当前 read 因绕行而获得的调度收益。
          */
         ftl_log("ZNS_READ_ESTSLACK,reqid=%lu,slba=%lu,nlb=%u,subops=%lu,"
                 "unique_planes=%lu,est_minlat_ns=%lu,est_maxlat_ns=%lu,"
@@ -1078,11 +1613,14 @@ static uint64_t zns_wc_flush(struct zns_ssd* zns, int wcidx, int type,uint64_t s
 }
 
 /* 处理一条 ZNS write：先写 SRAM write cache，必要时再 flush 到 NAND。 */
+/*处理一条主机写请求：把主机写入的 LBA 范围转换成 FTL 内部的 LPN，然后先写入 SRAM write cache；
+**如果 write cache 满了，或者需要复用别的 cache 槽位，就触发 zns_wc_flush把缓存里的数据真正写入NAND。
+**最后返回这条写请求看到的延迟 maxlat。*/
 static uint64_t zns_write(struct zns_ssd *zns, NvmeRequest *req)
 {
     /* 主机写请求的起始 LBA 和长度。 */
-    uint64_t lba = req->slba;
-    uint32_t nlb = req->nlb;
+    uint64_t lba = req->slba; //起始逻辑块地址
+    uint32_t nlb = req->nlb; //写请求覆盖的逻辑块数量
 
     /* 将请求的 LBA 范围换算成 4 KiB 粒度的逻辑页号 LPN。 */
     uint64_t secs_per_pg = LOGICAL_PAGE_SIZE/zns->lbasz;
@@ -1103,7 +1641,9 @@ static uint64_t zns_write(struct zns_ssd *zns, NvmeRequest *req)
 
     /* 当前 zone 优先复用已经绑定到自己的写缓存槽位。 */
     int wcidx = zns_get_wcidx(zns);
-
+    /*如果找到了，比如：wcidx = 2。说明当前 zone 已经在使用 write_cache[2]，后面直接往这个槽位追加 LPN。
+      如果找不到：wcidx == -1
+    */
     if(wcidx==-1)
     {
         /*
@@ -1152,7 +1692,8 @@ static uint64_t zns_write(struct zns_ssd *zns, NvmeRequest *req)
             //打印 flush 日志，写缓存的使用量
             femu_log("[W] flush wc %d (%u/%u)\n",wcidx,(int)zns->cache.write_cache[wcidx].used,(int)zns->cache.write_cache[wcidx].cap);
             sublat = zns_wc_flush(zns,wcidx,USER_IO,req->stime);
-            femu_log("[W] flush lat: %u\n", (int)sublat);//打印这次 flush 产生的延迟
+            //打印这次 flush 产生的延迟
+            femu_log("[W] flush lat: %u\n", (int)sublat);
             maxlat = (sublat > maxlat) ? sublat : maxlat;
             sublat = 0;
         }
