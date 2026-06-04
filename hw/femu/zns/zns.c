@@ -931,7 +931,11 @@ static uint16_t zns_nvme_rw(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
         //校验分区写入规则（如是否顺序写、分区是否满/只读等）
         status = zns_check_zone_write(n, ns, zone, slba, nlb, append);
         if (status) {
-            femu_err("Misao check zone write failed with status (%u)\n",status);
+            femu_err("Misao check zone write failed with status (%u), "
+                     "slba=%lu,nlb=%u,zone_start=%lu,zone_wp=%lu,"
+                     "zone_boundary=%lu,append=%u\n",
+                     status, slba, nlb, zone->d.zslba, zone->w_ptr,
+                     zns_zone_wr_boundary(zone), append ? 1 : 0);
             goto err;
         }
         if(append)

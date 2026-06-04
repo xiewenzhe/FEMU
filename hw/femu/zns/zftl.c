@@ -104,6 +104,71 @@ struct zns_read_bypass_queue {
     uint64_t cap;
 };
 
+enum zns_read_bypass_policy {
+    ZNS_READ_BYPASS_POLICY_NAIVE = 0,
+    ZNS_READ_BYPASS_POLICY_DYNAMIC,
+};
+
+enum zns_read_bypass_dynamic_block_mode {
+    ZNS_READ_BYPASS_DYNAMIC_BLOCK_PREFIX = 0,
+    ZNS_READ_BYPASS_DYNAMIC_BLOCK_VARIANTS,
+};
+
+/*
+ * dynamic block probe：围绕一个关键/近关键 target subop，尝试把同一条
+ * host read 中排在它前面的同 plane sibling 一起组成 block 前移。
+ *
+ * 这样可以处理 A B C 场景：C 是关键，B slack 小导致 C 单独绕不过，
+ * 但 [B C] 可以整体绕过 slack 充足的 A。
+ */
+struct zns_read_bypass_block_probe {
+    bool candidate;
+    bool valid;
+    bool reject_slack_insufficient;
+    bool reject_no_queue;
+    bool reject_empty_queue;
+    bool reject_tail_not_ready;
+    bool reject_same_req_tail;
+    bool reject_same_req_blocker;
+    uint64_t queue_len;
+    uint64_t victim_count;
+    uint64_t insertion_pos;
+    uint64_t block_start_idx;
+    uint64_t target_idx;
+    uint64_t block_count;
+    uint64_t block_delay;
+    uint64_t baseline_start;
+    uint64_t baseline_finish;
+    uint64_t start;
+    uint64_t finish;
+    uint64_t critset_size;
+    uint64_t critset_covered;
+    uint64_t critset_gain;
+    uint64_t critset_remaining_max;
+    int64_t critset_net_score;
+    uint64_t victim_cost;
+};
+
+/*
+ * dynamic opportunity funnel：记录每条 host read 在 dynamic probe 流程中
+ * 掉在哪一步。它只做诊断，不改变调度选择。
+ */
+struct zns_read_bypass_dynamic_funnel {
+    uint64_t target_subops;
+    uint64_t reject_noncritical_gap;
+    uint64_t near_critical_targets;
+    uint64_t reject_no_queue;
+    uint64_t reject_empty_queue;
+    uint64_t reject_tail_not_ready;
+    uint64_t reject_same_req_tail;
+    uint64_t queue_candidate_targets;
+    uint64_t reject_same_req_blocker;
+    uint64_t reject_slack_insufficient;
+    uint64_t valid_block_targets;
+    uint64_t reject_no_host_gain;
+    uint64_t positive_gain_targets;
+};
+
 #define ZNS_BYPASS_MAX_CH   (1 << CH_BITS)
 #define ZNS_BYPASS_MAX_LUN  (1 << FC_BITS)
 #define ZNS_BYPASS_MAX_PL   (1 << PL_BITS)
@@ -115,10 +180,22 @@ static uint64_t zns_read_slack_reqid;
 static struct zns_read_bypass_queue zns_read_bypass_queues[ZNS_BYPASS_MAX_PLANES];
 static bool zns_read_bypass_exec_flag_loaded;
 static bool zns_read_bypass_exec_flag;
-static bool zns_read_bypass_critical_only_flag_loaded;
-static bool zns_read_bypass_critical_only_flag;
-static bool zns_read_bypass_critical_reserve_flag_loaded;
-static bool zns_read_bypass_critical_reserve_flag;
+static bool zns_read_bypass_policy_loaded;
+static enum zns_read_bypass_policy zns_read_bypass_policy;
+static bool zns_read_bypass_dynamic_max_rounds_loaded;
+static uint64_t zns_read_bypass_dynamic_max_rounds = 1;
+static bool zns_read_bypass_dynamic_block_mode_loaded;
+static enum zns_read_bypass_dynamic_block_mode
+    zns_read_bypass_dynamic_block_mode =
+        ZNS_READ_BYPASS_DYNAMIC_BLOCK_PREFIX;
+static bool zns_read_bypass_dynamic_critset_policy_loaded;
+static bool zns_read_bypass_dynamic_critset_policy;
+static bool zns_read_bypass_dynamic_critset_neartie_loaded;
+static uint64_t zns_read_bypass_dynamic_critset_neartie_reads;
+static bool zns_read_bypass_dynamic_critset_cost_aware_loaded;
+static bool zns_read_bypass_dynamic_critset_cost_aware;
+static bool zns_read_bypass_dynamic_critset_cost_alpha_loaded;
+static uint64_t zns_read_bypass_dynamic_critset_cost_alpha_milli;
 
 static inline uint64_t zns_absdiff_u64(uint64_t a, uint64_t b)
 {
@@ -148,58 +225,152 @@ static bool zns_read_bypass_exec_enabled(void)
 }
 
 /*
- * critical-only 原型开关：
- *   unset 或 0：保持 naive execute，所有满足 slack 条件的 read subop 都可尝试绕行；
- *   1/true/on：只有在线估计为 predicted-critical 的 read subop 才允许真正绕行。
- *
- * 注意：非 critical subop 仍会被标记为 candidate，便于实验中统计“原本有多少
- * naive 机会被 critical-only 策略挡住”。
+ * 调度策略开关：
+ *   unset/naive：保持最初的 subop 局部贪心 execute；
+ *   dynamic：按整条 host read 的当前关键路径动态选择要绕过的 subop。
  */
-static bool zns_read_bypass_critical_only_enabled(void)
+static enum zns_read_bypass_policy zns_read_bypass_get_policy(void)
 {
     const char *value;
 
-    if (!zns_read_bypass_critical_only_flag_loaded) {
-        value = g_getenv("FEMU_ZNS_READ_BYPASS_CRITICAL_ONLY");
-        zns_read_bypass_critical_only_flag =
-            value &&
-            (!g_ascii_strcasecmp(value, "1") ||
-             !g_ascii_strcasecmp(value, "true") ||
-             !g_ascii_strcasecmp(value, "on"));
-        zns_read_bypass_critical_only_flag_loaded = true;
+    if (!zns_read_bypass_policy_loaded) {
+        value = g_getenv("FEMU_ZNS_READ_BYPASS_POLICY");
+        if (value && !g_ascii_strcasecmp(value, "dynamic")) {
+            zns_read_bypass_policy = ZNS_READ_BYPASS_POLICY_DYNAMIC;
+        } else {
+            zns_read_bypass_policy = ZNS_READ_BYPASS_POLICY_NAIVE;
+        }
+        zns_read_bypass_policy_loaded = true;
     }
 
-    return zns_read_bypass_critical_only_flag;
+    return zns_read_bypass_policy;
 }
 
 /*
- * near-critical first + slack reserve 原型开关：
- *   unset 或 0：不保留额外 slack，维持当前 execute 策略；
- *   1/true/on：predicted-noncritical 只有在 victim 被后移后仍至少剩下
- *              一个 read_delay slack 时才允许绕过。
- *
- * 换句话说：
- *   - predicted-critical:    victim_slack >= read_delay 即可绕过；
- *   - predicted-noncritical: victim_slack >= 2 * read_delay 才可绕过。
- *
- * 这样 noncritical 不是完全禁止，而是在不吃掉 critical reserve 的前提下
- * 才能利用 slack。
+ * dynamic 每条 host read 最多提交多少轮 block move。
+ * 默认 1，保持 t2 的 critical-block dynamic 语义；实验时可设为 2/3 做
+ * bounded multi-round 对照。
  */
-static bool zns_read_bypass_critical_reserve_enabled(void)
+static uint64_t zns_read_bypass_get_dynamic_max_rounds(void)
+{
+    const char *value;
+    char *end = NULL;
+    uint64_t parsed;
+
+    if (!zns_read_bypass_dynamic_max_rounds_loaded) {
+        value = g_getenv("FEMU_ZNS_READ_BYPASS_DYNAMIC_MAX_ROUNDS");
+        if (value && value[0]) {
+            parsed = g_ascii_strtoull(value, &end, 10);
+            if (end != value && parsed > 0) {
+                zns_read_bypass_dynamic_max_rounds = parsed;
+            }
+        }
+        zns_read_bypass_dynamic_max_rounds_loaded = true;
+    }
+
+    return zns_read_bypass_dynamic_max_rounds;
+}
+
+static enum zns_read_bypass_dynamic_block_mode
+zns_read_bypass_get_dynamic_block_mode(void)
 {
     const char *value;
 
-    if (!zns_read_bypass_critical_reserve_flag_loaded) {
-        value = g_getenv("FEMU_ZNS_READ_BYPASS_CRITICAL_RESERVE");
-        zns_read_bypass_critical_reserve_flag =
+    if (!zns_read_bypass_dynamic_block_mode_loaded) {
+        value = g_getenv("FEMU_ZNS_READ_BYPASS_DYNAMIC_BLOCK_MODE");
+        if (value && !g_ascii_strcasecmp(value, "variants")) {
+            zns_read_bypass_dynamic_block_mode =
+                ZNS_READ_BYPASS_DYNAMIC_BLOCK_VARIANTS;
+        } else {
+            zns_read_bypass_dynamic_block_mode =
+                ZNS_READ_BYPASS_DYNAMIC_BLOCK_PREFIX;
+        }
+        zns_read_bypass_dynamic_block_mode_loaded = true;
+    }
+
+    return zns_read_bypass_dynamic_block_mode;
+}
+
+static bool zns_read_bypass_dynamic_critset_policy_enabled(void)
+{
+    const char *value;
+
+    if (!zns_read_bypass_dynamic_critset_policy_loaded) {
+        value = g_getenv("FEMU_ZNS_READ_BYPASS_DYNAMIC_CRITSET_POLICY");
+        zns_read_bypass_dynamic_critset_policy =
             value &&
             (!g_ascii_strcasecmp(value, "1") ||
              !g_ascii_strcasecmp(value, "true") ||
              !g_ascii_strcasecmp(value, "on"));
-        zns_read_bypass_critical_reserve_flag_loaded = true;
+        zns_read_bypass_dynamic_critset_policy_loaded = true;
     }
 
-    return zns_read_bypass_critical_reserve_flag;
+    return zns_read_bypass_dynamic_critset_policy;
+}
+
+static uint64_t zns_read_bypass_get_dynamic_critset_neartie_reads(void)
+{
+    const char *value;
+    char *end = NULL;
+    uint64_t parsed;
+
+    if (!zns_read_bypass_dynamic_critset_neartie_loaded) {
+        value = g_getenv("FEMU_ZNS_READ_BYPASS_DYNAMIC_CRITSET_NEARTIE_READS");
+        if (value && value[0]) {
+            parsed = g_ascii_strtoull(value, &end, 10);
+            if (end != value) {
+                zns_read_bypass_dynamic_critset_neartie_reads = parsed;
+            }
+        }
+        zns_read_bypass_dynamic_critset_neartie_loaded = true;
+    }
+
+    return zns_read_bypass_dynamic_critset_neartie_reads;
+}
+
+static bool zns_read_bypass_dynamic_critset_cost_aware_enabled(void)
+{
+    const char *value;
+
+    if (!zns_read_bypass_dynamic_critset_cost_aware_loaded) {
+        value = g_getenv("FEMU_ZNS_READ_BYPASS_DYNAMIC_CRITSET_COST_AWARE");
+        zns_read_bypass_dynamic_critset_cost_aware =
+            value &&
+            (!g_ascii_strcasecmp(value, "1") ||
+             !g_ascii_strcasecmp(value, "true") ||
+             !g_ascii_strcasecmp(value, "on"));
+        zns_read_bypass_dynamic_critset_cost_aware_loaded = true;
+    }
+
+    return zns_read_bypass_dynamic_critset_cost_aware;
+}
+
+static uint64_t zns_read_bypass_get_dynamic_critset_cost_alpha_milli(void)
+{
+    const char *value;
+    char *end = NULL;
+    uint64_t parsed;
+
+    if (!zns_read_bypass_dynamic_critset_cost_alpha_loaded) {
+        value = g_getenv("FEMU_ZNS_READ_BYPASS_DYNAMIC_CRITSET_COST_ALPHA_MILLI");
+        if (value && value[0]) {
+            parsed = g_ascii_strtoull(value, &end, 10);
+            if (end != value) {
+                zns_read_bypass_dynamic_critset_cost_alpha_milli = parsed;
+            }
+        }
+        zns_read_bypass_dynamic_critset_cost_alpha_loaded = true;
+    }
+
+    return zns_read_bypass_dynamic_critset_cost_alpha_milli;
+}
+
+static int64_t zns_read_bypass_critset_net_score(uint64_t critset_gain,
+                                                 uint64_t victim_cost,
+                                                 uint64_t alpha_milli)
+{
+    return (int64_t)critset_gain -
+        (int64_t)((victim_cost * alpha_milli) / 1000);
 }
 
 /* 在当前 host read 的 shadow plane 表里查找某个 PPA 对应的 plane。 */
@@ -294,6 +465,26 @@ static void zns_read_bypass_queue_reserve_one(struct zns_read_bypass_queue *queu
                                    sizeof(*queue->entries) * new_cap);
         queue->cap = new_cap;
     }
+}
+
+static void zns_read_bypass_queue_reserve(struct zns_read_bypass_queue *queue,
+                                          uint64_t extra)
+{
+    uint64_t need = queue->len + extra;
+    uint64_t new_cap;
+
+    if (need <= queue->cap) {
+        return;
+    }
+
+    new_cap = queue->cap ? queue->cap : 8;
+    while (new_cap < need) {
+        new_cap *= 2;
+    }
+
+    queue->entries = g_realloc(queue->entries,
+                               sizeof(*queue->entries) * new_cap);
+    queue->cap = new_cap;
 }
 
 //往队列尾部加入一个 read entry
@@ -526,6 +717,838 @@ static void zns_read_bypass_dryrun(uint64_t reqid,
     }
 }
 
+static uint64_t zns_read_bypass_model_maxlat(uint64_t *finish,
+                                             uint64_t sample_cnt,
+                                             uint64_t read_stime)
+{
+    uint64_t i;
+    uint64_t maxlat = 0;
+
+    for (i = 0; i < sample_cnt; i++) {
+        uint64_t sublat = finish[i] - read_stime;
+        maxlat = (sublat > maxlat) ? sublat : maxlat;
+    }
+
+    return maxlat;
+}
+
+static uint64_t zns_read_bypass_model_critical_idx(uint64_t *finish,
+                                                   uint64_t sample_cnt,
+                                                   uint64_t read_stime)
+{
+    uint64_t critical_idx = 0;
+    uint64_t maxlat = 0;
+    uint64_t i;
+
+    for (i = 0; i < sample_cnt; i++) {
+        uint64_t sublat = finish[i] - read_stime;
+
+        if (sublat > maxlat) {
+            maxlat = sublat;
+            critical_idx = i;
+        }
+    }
+
+    return critical_idx;
+}
+
+static bool zns_read_bypass_block_contains(
+    struct zns_read_slack_sample *samples, bool *scheduled,
+    uint64_t block_start_idx, uint64_t target_idx, uint64_t idx);
+
+static void zns_read_bypass_compute_critset_metrics(
+    struct zns_read_slack_sample *samples, bool *scheduled,
+    uint64_t sample_cnt, uint64_t read_stime, uint64_t old_maxlat,
+    uint64_t *old_finish, uint64_t *new_finish,
+    struct zns_read_bypass_block_probe *probe,
+    uint64_t *critset_size, uint64_t *critset_covered,
+    uint64_t *critset_gain, uint64_t *critset_remaining_max)
+{
+    uint64_t i;
+
+    *critset_size = 0;
+    *critset_covered = 0;
+    *critset_gain = 0;
+    *critset_remaining_max = 0;
+
+    for (i = 0; i < sample_cnt; i++) {
+        uint64_t old_sublat = old_finish[i] - read_stime;
+        uint64_t new_sublat = new_finish[i] - read_stime;
+        uint64_t gap = (old_sublat < old_maxlat) ?
+            (old_maxlat - old_sublat) : 0;
+
+        if (gap > samples[i].read_delay) {
+            continue;
+        }
+
+        (*critset_size)++;
+        *critset_remaining_max =
+            (new_sublat > *critset_remaining_max) ?
+            new_sublat : *critset_remaining_max;
+
+        if (zns_read_bypass_block_contains(samples, scheduled,
+                                           probe->block_start_idx,
+                                           probe->target_idx, i)) {
+            (*critset_covered)++;
+            if (old_sublat > new_sublat) {
+                *critset_gain += old_sublat - new_sublat;
+            }
+        }
+    }
+}
+
+/*
+ * 根据当前真实 plane 队列，刷新“如果剩余 subop 不再 bypass”的完成时间。
+ * 已经 commit 的 subop 使用真实 exec_finish；未 commit 的 subop 按原始顺序
+ * 接到各自 plane 队尾，用 shadow plane 时间线避免提前改真实状态。
+ */
+static void zns_read_bypass_refresh_dynamic_model(
+    struct zns_ssd *zns, struct zns_read_slack_sample *samples,
+    uint64_t sample_cnt, bool *scheduled, uint64_t read_stime,
+    uint64_t *model_finish)
+{
+    struct zns_read_shadow_plane *shadow_planes;
+    uint64_t shadow_cnt = 0;
+    uint64_t i;
+
+    shadow_planes = g_malloc0(sizeof(*shadow_planes) * sample_cnt);
+
+    for (i = 0; i < sample_cnt; i++) {
+        struct zns_read_shadow_plane *shadow;
+        struct ppa *sppa = &samples[i].ppa;
+
+        if (scheduled[i]) {
+            model_finish[i] = samples[i].exec_finish;
+            continue;
+        }
+
+        shadow = zns_find_read_shadow_plane(shadow_planes, shadow_cnt, sppa);
+        if (!shadow) {
+            shadow = &shadow_planes[shadow_cnt++];
+            shadow->ch = sppa->g.ch;
+            shadow->lun = sppa->g.fc;
+            shadow->pl = sppa->g.pl;
+            shadow->avail = get_plane(zns, sppa)->next_plane_avail_time;
+        }
+
+        model_finish[i] =
+            ((shadow->avail < read_stime) ? read_stime : shadow->avail) +
+            samples[i].read_delay;
+        shadow->avail = model_finish[i];
+    }
+
+    g_free(shadow_planes);
+}
+
+static bool zns_read_bypass_same_plane(struct zns_read_slack_sample *a,
+                                       struct zns_read_slack_sample *b)
+{
+    return a->ppa.g.ch == b->ppa.g.ch &&
+           a->ppa.g.fc == b->ppa.g.fc &&
+           a->ppa.g.pl == b->ppa.g.pl;
+}
+
+static bool zns_read_bypass_block_contains(
+    struct zns_read_slack_sample *samples, bool *scheduled,
+    uint64_t block_start_idx, uint64_t target_idx, uint64_t idx)
+{
+    if (idx < block_start_idx || idx > target_idx || scheduled[idx]) {
+        return false;
+    }
+
+    return zns_read_bypass_same_plane(&samples[idx], &samples[target_idx]);
+}
+
+static uint64_t zns_read_bypass_block_prefix_start(
+    struct zns_read_slack_sample *samples, uint64_t sample_cnt,
+    bool *scheduled, uint64_t target_idx)
+{
+    uint64_t start = target_idx;
+    uint64_t i;
+
+    for (i = 0; i < sample_cnt; i++) {
+        if (i > target_idx || scheduled[i]) {
+            continue;
+        }
+        if (zns_read_bypass_same_plane(&samples[i], &samples[target_idx])) {
+            start = i;
+            break;
+        }
+    }
+
+    return start;
+}
+
+static struct zns_read_bypass_block_probe zns_read_bypass_probe_block(
+    uint64_t reqid, struct zns_ssd *zns,
+    struct zns_read_slack_sample *samples, uint64_t sample_cnt,
+    bool *scheduled, uint64_t block_start_idx, uint64_t target_idx,
+    uint64_t read_stime)
+{
+    struct zns_read_bypass_block_probe probe = { 0 };
+    struct zns_read_bypass_queue *queue =
+        zns_read_bypass_get_queue(&samples[target_idx].ppa);
+    struct zns_plane *pl = get_plane(zns, &samples[target_idx].ppa);
+    uint64_t old_avail = pl->next_plane_avail_time;
+    uint64_t pos;
+    uint64_t i;
+
+    probe.block_start_idx = block_start_idx;
+    probe.target_idx = target_idx;
+    probe.baseline_start = (old_avail < read_stime) ? read_stime : old_avail;
+    probe.start = probe.baseline_start;
+
+    for (i = block_start_idx; i <= target_idx; i++) {
+        if (zns_read_bypass_block_contains(samples, scheduled,
+                                           block_start_idx, target_idx, i)) {
+            probe.block_count++;
+            probe.block_delay += samples[i].read_delay;
+        }
+    }
+
+    if (!probe.block_count) {
+        return probe;
+    }
+
+    probe.baseline_finish = probe.baseline_start + probe.block_delay;
+    probe.finish = probe.baseline_finish;
+
+    if (!queue) {
+        probe.reject_no_queue = true;
+        return probe;
+    }
+
+    zns_read_bypass_prune_started(queue, read_stime);
+    probe.queue_len = queue->len;
+
+    if (!queue->len) {
+        probe.reject_empty_queue = true;
+        return probe;
+    }
+
+    if (queue->entries[queue->len - 1].finish != probe.baseline_start) {
+        probe.reject_tail_not_ready = true;
+        return probe;
+    }
+
+    if (queue->entries[queue->len - 1].reqid == reqid) {
+        probe.reject_same_req_tail = true;
+        return probe;
+    }
+
+    probe.candidate = true;
+
+    for (pos = queue->len; pos > 0; pos--) {
+        struct zns_read_bypass_entry *victim = &queue->entries[pos - 1];
+
+        if (victim->reqid == reqid) {
+            probe.reject_same_req_blocker = true;
+            break;
+        }
+
+        if (victim->slack < probe.block_delay) {
+            probe.reject_slack_insufficient = true;
+            break;
+        }
+
+        probe.victim_count++;
+    }
+
+    if (probe.victim_count) {
+        probe.valid = true;
+        probe.insertion_pos = queue->len - probe.victim_count;
+        probe.start = queue->entries[probe.insertion_pos].start;
+        probe.finish = probe.start + probe.block_delay;
+    }
+
+    return probe;
+}
+
+static uint64_t zns_read_bypass_model_maxlat_after_block_probe(
+    struct zns_ssd *zns, struct zns_read_slack_sample *samples,
+    uint64_t sample_cnt, bool *scheduled, uint64_t read_stime,
+    struct zns_read_bypass_block_probe *probe, uint64_t *probe_finish)
+{
+    struct zns_read_shadow_plane *shadow_planes;
+    bool *in_block;
+    uint64_t shadow_cnt = 0;
+    uint64_t block_next = probe->start;
+    uint64_t maxlat = 0;
+    uint64_t i;
+
+    shadow_planes = g_malloc0(sizeof(*shadow_planes) * sample_cnt);
+    in_block = g_malloc0(sizeof(*in_block) * sample_cnt);
+
+    for (i = 0; i < sample_cnt; i++) {
+        in_block[i] = zns_read_bypass_block_contains(samples, scheduled,
+                                                     probe->block_start_idx,
+                                                     probe->target_idx, i);
+    }
+
+    for (i = 0; i < sample_cnt; i++) {
+        struct zns_read_shadow_plane *shadow;
+        struct ppa *sppa = &samples[i].ppa;
+        uint64_t finish;
+        uint64_t sublat;
+
+        if (scheduled[i]) {
+            finish = samples[i].exec_finish;
+            goto update_maxlat;
+        }
+
+        if (in_block[i]) {
+            finish = block_next + samples[i].read_delay;
+            block_next = finish;
+            goto update_maxlat;
+        }
+
+        shadow = zns_find_read_shadow_plane(shadow_planes, shadow_cnt, sppa);
+        if (!shadow) {
+            shadow = &shadow_planes[shadow_cnt++];
+            shadow->ch = sppa->g.ch;
+            shadow->lun = sppa->g.fc;
+            shadow->pl = sppa->g.pl;
+            shadow->avail = get_plane(zns, sppa)->next_plane_avail_time;
+
+            /*
+             * block 插入后，目标 plane 的队尾时间与“把这个 block 按普通
+             * 顺序接到队尾”相同，都是 baseline_finish。后续未纳入 block
+             * 的同 plane sibling 需要从这个时间之后继续排队。
+             */
+            if (zns_read_bypass_same_plane(&samples[i],
+                                           &samples[probe->target_idx]) &&
+                shadow->avail < probe->baseline_finish) {
+                shadow->avail = probe->baseline_finish;
+            }
+        }
+
+        finish = ((shadow->avail < read_stime) ? read_stime : shadow->avail) +
+            samples[i].read_delay;
+        shadow->avail = finish;
+
+update_maxlat:
+        if (probe_finish) {
+            probe_finish[i] = finish;
+        }
+        sublat = finish - read_stime;
+        maxlat = (sublat > maxlat) ? sublat : maxlat;
+    }
+
+    g_free(in_block);
+    g_free(shadow_planes);
+    return maxlat;
+}
+
+static uint64_t zns_read_bypass_append_subop(
+    uint64_t reqid, uint64_t subidx, struct zns_ssd *zns,
+    struct zns_read_slack_sample *sample, uint64_t read_stime,
+    uint64_t req_deadline)
+{
+    struct zns_read_bypass_queue *queue =
+        zns_read_bypass_get_queue(&sample->ppa);
+    struct zns_plane *pl = get_plane(zns, &sample->ppa);
+    uint64_t old_avail = pl->next_plane_avail_time;
+    uint64_t start = (old_avail < read_stime) ? read_stime : old_avail;
+    uint64_t finish = start + sample->read_delay;
+    struct zns_read_bypass_entry entry;
+
+    if (!queue) {
+        pl->next_plane_avail_time = finish;
+    } else {
+        zns_read_bypass_prune_started(queue, read_stime);
+        entry = zns_read_bypass_make_entry(reqid, subidx, sample, read_stime,
+                                           req_deadline, start, finish);
+        zns_read_bypass_queue_push(queue, &entry);
+        pl->next_plane_avail_time = queue->entries[queue->len - 1].finish;
+    }
+
+    sample->exec_start = start;
+    sample->exec_finish = finish;
+    sample->exec_hops = 0;
+    sample->exec_benefit = 0;
+
+    femu_log("[PU] cmd=READ req=%lu old_avail=%lu start=%lu finish=%lu delay=%lu "
+             "lat=%lu wait=%lu idle=%lu ch=%u lun=%u pl=%u blk=%u pg=%u spg=%u\n",
+             read_stime, old_avail, start, finish, sample->read_delay,
+             finish - read_stime,
+             (start > read_stime) ? (start - read_stime) : 0,
+             (read_stime > old_avail) ? (read_stime - old_avail) : 0,
+             sample->ppa.g.ch, sample->ppa.g.fc, sample->ppa.g.pl,
+             sample->ppa.g.blk, sample->ppa.g.pg, sample->ppa.g.spg);
+
+    return finish - read_stime;
+}
+
+static void zns_read_bypass_commit_block_probe(
+    uint64_t reqid, struct zns_ssd *zns,
+    struct zns_read_slack_sample *samples, bool *scheduled,
+    uint64_t read_stime, uint64_t req_deadline,
+    struct zns_read_bypass_block_probe *probe)
+{
+    struct zns_read_bypass_queue *queue =
+        zns_read_bypass_get_queue(&samples[probe->target_idx].ppa);
+    struct zns_plane *pl = get_plane(zns, &samples[probe->target_idx].ppa);
+    uint64_t pos;
+    uint64_t i;
+    uint64_t block_pos = 0;
+    uint64_t block_next = probe->start;
+
+    if (!queue || !probe->valid) {
+        return;
+    }
+
+    zns_read_bypass_queue_reserve(queue, probe->block_count);
+
+    for (pos = queue->len; pos > probe->insertion_pos; pos--) {
+        struct zns_read_bypass_entry victim = queue->entries[pos - 1];
+        uint64_t old_start = victim.start;
+        uint64_t old_finish = victim.finish;
+        uint64_t old_slack = victim.slack;
+
+        victim.start += probe->block_delay;
+        victim.finish += probe->block_delay;
+        victim.slack -= probe->block_delay;
+        victim.slack_consumed_by_pred_critical += probe->block_delay;
+        queue->entries[pos + probe->block_count - 1] = victim;
+
+        ftl_log("ZNS_READ_BYPASS_DYNAMIC_BLOCK_HOP,reqid=%lu,"
+                "target_subidx=%lu,hop=%lu,victim_reqid=%lu,"
+                "victim_subidx=%lu,victim_lpn=%lu,victim_old_start_ns=%lu,"
+                "victim_old_finish_ns=%lu,victim_new_start_ns=%lu,"
+                "victim_new_finish_ns=%lu,victim_deadline_ns=%lu,"
+                "victim_old_slack_ns=%lu,victim_new_slack_ns=%lu,"
+                "slack_used_ns=%lu,block_count=%lu\n",
+                reqid, probe->target_idx,
+                queue->len - pos + 1, victim.reqid, victim.subidx,
+                victim.lpn, old_start, old_finish, victim.start,
+                victim.finish, victim.deadline, old_slack, victim.slack,
+                probe->block_delay, probe->block_count);
+    }
+
+    for (i = probe->block_start_idx; i <= probe->target_idx; i++) {
+        struct zns_read_bypass_entry entry;
+        uint64_t start;
+        uint64_t finish;
+        uint64_t baseline_finish;
+
+        if (!zns_read_bypass_block_contains(samples, scheduled,
+                                            probe->block_start_idx,
+                                            probe->target_idx, i)) {
+            continue;
+        }
+
+        start = block_next;
+        finish = start + samples[i].read_delay;
+        block_next = finish;
+        baseline_finish = probe->baseline_start + block_next - probe->start;
+
+        entry = zns_read_bypass_make_entry(reqid, i, &samples[i], read_stime,
+                                           req_deadline, start, finish);
+        queue->entries[probe->insertion_pos + block_pos] = entry;
+
+        samples[i].exec_start = start;
+        samples[i].exec_finish = finish;
+        samples[i].exec_hops = probe->victim_count;
+        samples[i].exec_benefit = (baseline_finish > finish) ?
+            (baseline_finish - finish) : 0;
+        samples[i].exec_consumed_victim_slack =
+            probe->victim_count * samples[i].read_delay;
+        samples[i].exec_candidate = true;
+        scheduled[i] = true;
+
+        ftl_log("ZNS_READ_BYPASS_DYNAMIC_BLOCK_ENTRY,reqid=%lu,"
+                "subidx=%lu,lpn=%lu,target_subidx=%lu,block_start_subidx=%lu,"
+                "block_pos=%lu,"
+                "victim_count=%lu,baseline_finish_ns=%lu,"
+                "exec_start_ns=%lu,exec_finish_ns=%lu,benefit_ns=%lu,"
+                "pred_critical=%u,pred_critical_gap_ns=%lu\n",
+                reqid, i, samples[i].lpn, probe->target_idx,
+                probe->block_start_idx, block_pos,
+                probe->victim_count, baseline_finish, start, finish,
+                samples[i].exec_benefit, samples[i].pred_critical ? 1 : 0,
+                samples[i].pred_critical_gap);
+
+        femu_log("[PU] cmd=READ req=%lu old_avail=%lu start=%lu finish=%lu delay=%lu "
+                 "lat=%lu wait=%lu idle=%lu ch=%u lun=%u pl=%u blk=%u pg=%u spg=%u\n",
+                 read_stime, probe->baseline_start, start, finish,
+                 samples[i].read_delay, finish - read_stime,
+                 (start > read_stime) ? (start - read_stime) : 0,
+                 (uint64_t)0, samples[i].ppa.g.ch, samples[i].ppa.g.fc,
+                 samples[i].ppa.g.pl, samples[i].ppa.g.blk,
+                 samples[i].ppa.g.pg, samples[i].ppa.g.spg);
+
+        block_pos++;
+    }
+
+    queue->len += probe->block_count;
+    pl->next_plane_avail_time = queue->entries[queue->len - 1].finish;
+}
+
+static bool zns_read_bypass_find_best_dynamic_probe(
+    uint64_t reqid, struct zns_ssd *zns,
+    struct zns_read_slack_sample *samples, uint64_t sample_cnt,
+    bool *scheduled, uint64_t *model_finish, uint64_t read_stime,
+    struct zns_read_bypass_block_probe *best_probe, uint64_t *best_gain,
+    uint64_t *best_cost, uint64_t *best_gap, uint64_t *best_block_count,
+    uint64_t *probed_subops, struct zns_read_bypass_dynamic_funnel *funnel,
+    bool mark_samples)
+{
+    enum zns_read_bypass_dynamic_block_mode block_mode =
+        zns_read_bypass_get_dynamic_block_mode();
+    bool critset_policy =
+        zns_read_bypass_dynamic_critset_policy_enabled();
+    uint64_t critset_neartie_reads =
+        zns_read_bypass_get_dynamic_critset_neartie_reads();
+    bool critset_cost_aware =
+        zns_read_bypass_dynamic_critset_cost_aware_enabled();
+    uint64_t critset_cost_alpha_milli =
+        zns_read_bypass_get_dynamic_critset_cost_alpha_milli();
+    uint64_t old_maxlat;
+    bool found = false;
+    uint64_t best_critset_covered = 0;
+    uint64_t best_critset_gain = 0;
+    int64_t best_critset_net_score = INT64_MIN;
+    uint64_t i;
+
+    *best_probe = (struct zns_read_bypass_block_probe) { 0 };
+    *best_gain = 0;
+    *best_cost = 0;
+    *best_gap = 0;
+    *best_block_count = 0;
+
+    old_maxlat = zns_read_bypass_model_maxlat(model_finish, sample_cnt,
+                                              read_stime);
+
+    for (i = 0; i < sample_cnt; i++) {
+        struct zns_read_bypass_block_probe probe;
+        uint64_t gap;
+        uint64_t new_maxlat;
+        uint64_t gain;
+        uint64_t cost;
+
+        if (scheduled[i]) {
+            continue;
+        }
+
+        if (funnel) {
+            funnel->target_subops++;
+        }
+
+        gap = (model_finish[i] - read_stime < old_maxlat) ?
+            (old_maxlat - (model_finish[i] - read_stime)) : 0;
+
+        /*
+         * dynamic 的目标仍然是关键/近关键 subop；非关键 subop 只有在
+         * 作为 target 前面的 blocker 被纳入 block 时才会一起移动。
+         */
+        if (gap > samples[i].read_delay) {
+            if (funnel) {
+                funnel->reject_noncritical_gap++;
+            }
+            continue;
+        }
+
+        if (funnel) {
+            funnel->near_critical_targets++;
+        }
+
+        {
+            bool target_reject_no_queue = false;
+            bool target_reject_empty_queue = false;
+            bool target_reject_tail_not_ready = false;
+            bool target_reject_same_req_tail = false;
+            bool target_candidate = false;
+            bool target_reject_same_req_blocker = false;
+            bool target_reject_slack_insufficient = false;
+            bool target_valid = false;
+            bool target_positive_gain = false;
+            uint64_t start_limit = zns_read_bypass_block_prefix_start(
+                samples, sample_cnt, scheduled, i);
+            uint64_t block_start_idx =
+                (block_mode == ZNS_READ_BYPASS_DYNAMIC_BLOCK_PREFIX) ?
+                start_limit : i;
+            bool keep_going = true;
+
+            while (keep_going) {
+                probe = zns_read_bypass_probe_block(reqid, zns, samples,
+                                                    sample_cnt, scheduled,
+                                                    block_start_idx, i,
+                                                    read_stime);
+                target_reject_no_queue |= probe.reject_no_queue;
+                target_reject_empty_queue |= probe.reject_empty_queue;
+                target_reject_tail_not_ready |= probe.reject_tail_not_ready;
+                target_reject_same_req_tail |= probe.reject_same_req_tail;
+                target_candidate |= probe.candidate;
+                target_reject_same_req_blocker |=
+                    probe.reject_same_req_blocker;
+                target_reject_slack_insufficient |=
+                    probe.reject_slack_insufficient;
+                (*probed_subops)++;
+
+                if (probe.valid) {
+                    uint64_t *probe_finish;
+                    uint64_t old_critical_idx;
+                    uint64_t new_critical_idx;
+                    uint64_t target_sublat_before;
+                    uint64_t old_critical_sublat;
+                    uint64_t new_critical_sublat;
+                    uint64_t critset_size;
+                    uint64_t critset_covered;
+                    uint64_t critset_gain;
+                    uint64_t critset_remaining_max;
+                    uint64_t victim_cost;
+                    int64_t critset_net_score;
+                    bool positive_gain;
+
+                    target_valid = true;
+                    probe_finish = g_malloc0(sizeof(*probe_finish) * sample_cnt);
+                    new_maxlat = zns_read_bypass_model_maxlat_after_block_probe(
+                        zns, samples, sample_cnt, scheduled, read_stime,
+                        &probe, probe_finish);
+                    old_critical_idx = zns_read_bypass_model_critical_idx(
+                        model_finish, sample_cnt, read_stime);
+                    new_critical_idx = zns_read_bypass_model_critical_idx(
+                        probe_finish, sample_cnt, read_stime);
+                    target_sublat_before = model_finish[i] - read_stime;
+                    old_critical_sublat =
+                        model_finish[old_critical_idx] - read_stime;
+                    new_critical_sublat =
+                        probe_finish[new_critical_idx] - read_stime;
+                    zns_read_bypass_compute_critset_metrics(
+                        samples, scheduled, sample_cnt, read_stime,
+                        old_maxlat, model_finish, probe_finish, &probe,
+                        &critset_size, &critset_covered, &critset_gain,
+                        &critset_remaining_max);
+                    victim_cost = probe.block_delay * probe.victim_count;
+                    critset_net_score = zns_read_bypass_critset_net_score(
+                        critset_gain, victim_cost,
+                        critset_cost_aware ? critset_cost_alpha_milli : 0);
+                    probe.critset_size = critset_size;
+                    probe.critset_covered = critset_covered;
+                    probe.critset_gain = critset_gain;
+                    probe.critset_remaining_max = critset_remaining_max;
+                    probe.victim_cost = victim_cost;
+                    probe.critset_net_score = critset_net_score;
+                    positive_gain = new_maxlat < old_maxlat;
+
+                    ftl_log("ZNS_READ_BYPASS_DYNAMIC_CRITSET,reqid=%lu,"
+                            "target_subidx=%lu,block_start_subidx=%lu,"
+                            "block_count=%lu,victim_count=%lu,"
+                            "old_maxlat_ns=%lu,new_maxlat_ns=%lu,"
+                            "host_gain_ns=%lu,critical_set_size=%lu,"
+                            "critical_set_covered=%lu,"
+                            "critical_set_gain_ns=%lu,"
+                            "critical_set_remaining_max_ns=%lu,"
+                            "victim_cost_ns=%lu,"
+                            "critical_set_net_score_ns=%ld,"
+                            "old_critical_subidx=%lu,"
+                            "new_critical_subidx=%lu,"
+                            "positive_gain=%u,critset_policy=%u,"
+                            "critset_neartie_reads=%lu,"
+                            "critset_cost_aware=%u,"
+                            "critset_cost_alpha_milli=%lu\n",
+                            reqid, probe.target_idx, probe.block_start_idx,
+                            probe.block_count, probe.victim_count,
+                            old_maxlat, new_maxlat,
+                            positive_gain ? old_maxlat - new_maxlat : 0,
+                            critset_size, critset_covered, critset_gain,
+                            critset_remaining_max, victim_cost,
+                            critset_net_score, old_critical_idx,
+                            new_critical_idx, positive_gain ? 1 : 0,
+                            critset_policy ? 1 : 0, critset_neartie_reads,
+                            critset_cost_aware ? 1 : 0,
+                            critset_cost_alpha_milli);
+
+                    if (positive_gain) {
+                        uint64_t neartie_window =
+                            critset_neartie_reads * samples[i].read_delay;
+                        bool gain_near_best;
+                        bool critset_can_break_tie;
+                        bool better;
+
+                        target_positive_gain = true;
+                        gain = old_maxlat - new_maxlat;
+                        cost = victim_cost;
+
+                        gain_near_best = found &&
+                            (*best_gain > gain ?
+                             (*best_gain - gain <= neartie_window) :
+                             (gain - *best_gain <= neartie_window));
+                        critset_can_break_tie = critset_policy &&
+                            (gain == *best_gain ||
+                             (neartie_window && gain_near_best));
+
+                        if (!found) {
+                            better = true;
+                        } else if (critset_can_break_tie) {
+                            if (critset_cost_aware &&
+                                critset_cost_alpha_milli > 0) {
+                                better =
+                                    critset_covered > best_critset_covered ||
+                                    (critset_covered ==
+                                     best_critset_covered &&
+                                     critset_net_score >
+                                     best_critset_net_score) ||
+                                    (critset_covered ==
+                                     best_critset_covered &&
+                                     critset_net_score ==
+                                     best_critset_net_score &&
+                                     critset_gain > best_critset_gain) ||
+                                    (critset_covered ==
+                                     best_critset_covered &&
+                                     critset_net_score ==
+                                     best_critset_net_score &&
+                                     critset_gain == best_critset_gain &&
+                                     gain > *best_gain) ||
+                                    (critset_covered ==
+                                     best_critset_covered &&
+                                     critset_net_score ==
+                                     best_critset_net_score &&
+                                     critset_gain == best_critset_gain &&
+                                     gain == *best_gain &&
+                                     probe.block_count < *best_block_count) ||
+                                    (critset_covered ==
+                                     best_critset_covered &&
+                                     critset_net_score ==
+                                     best_critset_net_score &&
+                                     critset_gain == best_critset_gain &&
+                                     gain == *best_gain &&
+                                     probe.block_count ==
+                                     *best_block_count && cost < *best_cost) ||
+                                    (critset_covered ==
+                                     best_critset_covered &&
+                                     critset_net_score ==
+                                     best_critset_net_score &&
+                                     critset_gain == best_critset_gain &&
+                                     gain == *best_gain &&
+                                     probe.block_count ==
+                                     *best_block_count &&
+                                     cost == *best_cost && gap < *best_gap);
+                            } else {
+                                better =
+                                    critset_covered > best_critset_covered ||
+                                    (critset_covered ==
+                                     best_critset_covered &&
+                                     critset_gain > best_critset_gain) ||
+                                    (critset_covered ==
+                                     best_critset_covered &&
+                                     critset_gain == best_critset_gain &&
+                                     gain > *best_gain) ||
+                                    (critset_covered ==
+                                     best_critset_covered &&
+                                     critset_gain == best_critset_gain &&
+                                     gain == *best_gain &&
+                                     probe.block_count < *best_block_count) ||
+                                    (critset_covered ==
+                                     best_critset_covered &&
+                                     critset_gain == best_critset_gain &&
+                                     gain == *best_gain &&
+                                     probe.block_count ==
+                                     *best_block_count && cost < *best_cost) ||
+                                    (critset_covered ==
+                                     best_critset_covered &&
+                                     critset_gain == best_critset_gain &&
+                                     gain == *best_gain &&
+                                     probe.block_count ==
+                                     *best_block_count &&
+                                     cost == *best_cost && gap < *best_gap);
+                            }
+                        } else {
+                            better =
+                                gain > *best_gain ||
+                                (gain == *best_gain &&
+                                 probe.block_count < *best_block_count) ||
+                                (gain == *best_gain &&
+                                 probe.block_count == *best_block_count &&
+                                 cost < *best_cost) ||
+                                (gain == *best_gain &&
+                                 probe.block_count == *best_block_count &&
+                                 cost == *best_cost && gap < *best_gap);
+                        }
+
+                        if (better) {
+                            found = true;
+                            *best_probe = probe;
+                            *best_gain = gain;
+                            *best_gap = gap;
+                            *best_cost = cost;
+                            *best_block_count = probe.block_count;
+                            best_critset_covered = critset_covered;
+                            best_critset_gain = critset_gain;
+                            best_critset_net_score = critset_net_score;
+                        }
+                    } else {
+                        ftl_log("ZNS_READ_BYPASS_DYNAMIC_NO_GAIN,reqid=%lu,"
+                                "target_subidx=%lu,block_start_subidx=%lu,"
+                                "block_count=%lu,victim_count=%lu,"
+                                "old_maxlat_ns=%lu,new_maxlat_ns=%lu,"
+                                "target_sublat_before_ns=%lu,"
+                                "target_gap_to_old_max_ns=%lu,"
+                                "old_critical_subidx=%lu,"
+                                "old_critical_sublat_ns=%lu,"
+                                "new_critical_subidx=%lu,"
+                                "new_critical_sublat_ns=%lu,"
+                                "target_is_old_critical=%u,"
+                                "target_is_new_critical=%u\n",
+                                reqid, probe.target_idx,
+                                probe.block_start_idx, probe.block_count,
+                                probe.victim_count, old_maxlat, new_maxlat,
+                                target_sublat_before, gap,
+                                old_critical_idx, old_critical_sublat,
+                                new_critical_idx, new_critical_sublat,
+                                old_critical_idx == i ? 1 : 0,
+                                new_critical_idx == i ? 1 : 0);
+                    }
+                    g_free(probe_finish);
+                }
+
+                if (block_mode != ZNS_READ_BYPASS_DYNAMIC_BLOCK_VARIANTS ||
+                    block_start_idx == start_limit) {
+                    break;
+                }
+
+                keep_going = false;
+                while (block_start_idx > start_limit) {
+                    block_start_idx--;
+                    if (!scheduled[block_start_idx] &&
+                        zns_read_bypass_same_plane(&samples[block_start_idx],
+                                                   &samples[i])) {
+                        keep_going = true;
+                        break;
+                    }
+                }
+            }
+
+            if (funnel) {
+                funnel->reject_no_queue += target_reject_no_queue ? 1 : 0;
+                funnel->reject_empty_queue += target_reject_empty_queue ? 1 : 0;
+                funnel->reject_tail_not_ready +=
+                    target_reject_tail_not_ready ? 1 : 0;
+                funnel->reject_same_req_tail +=
+                    target_reject_same_req_tail ? 1 : 0;
+                funnel->queue_candidate_targets += target_candidate ? 1 : 0;
+                funnel->reject_same_req_blocker +=
+                    target_reject_same_req_blocker ? 1 : 0;
+                funnel->reject_slack_insufficient +=
+                    target_reject_slack_insufficient ? 1 : 0;
+                funnel->valid_block_targets += target_valid ? 1 : 0;
+                funnel->reject_no_host_gain +=
+                    (target_valid && !target_positive_gain) ? 1 : 0;
+                funnel->positive_gain_targets += target_positive_gain ? 1 : 0;
+            }
+            if (mark_samples) {
+                samples[i].exec_candidate =
+                    samples[i].exec_candidate || target_candidate;
+                samples[i].exec_reject_slack_insufficient =
+                    samples[i].exec_reject_slack_insufficient ||
+                    target_reject_slack_insufficient;
+            }
+        }
+    }
+
+    return found;
+}
+
 /*
  * 真正执行 read-read bypass。
  *
@@ -564,8 +1587,6 @@ static uint64_t zns_read_bypass_execute(uint64_t reqid, uint64_t subidx,
     uint64_t hops = 0;
     uint64_t insertion_pos = 0;
     uint64_t pos;
-    bool critical_only = zns_read_bypass_critical_only_enabled();
-    bool critical_reserve = zns_read_bypass_critical_reserve_enabled();
 
     if (!queue) {
         /*
@@ -594,16 +1615,6 @@ static uint64_t zns_read_bypass_execute(uint64_t reqid, uint64_t subidx,
         sample->exec_candidate = true;
 
         /*
-         * t3 critical-only 策略：非 predicted-critical subop 只记录为
-         * candidate，不真正前移。这样可以和 t2 naive execute 对比：
-         *   - candidate_subops 仍表示原始连续队列机会；
-         *   - executed_subops 表示 critical-only 策略实际放行的机会。
-         */
-        if (critical_only && !sample->pred_critical) {
-            goto skip_bypass_scan;
-        }
-
-        /*
          * 从队尾向队头扫描。只要 victim 仍有足够 slack，就继续前移。
          * 如果遇到同一条 host read 内更早的子请求，也停止，避免 sibling
          * subop 在 execute 原型里互相穿插。
@@ -614,16 +1625,6 @@ static uint64_t zns_read_bypass_execute(uint64_t reqid, uint64_t subidx,
 
             if (victim->reqid == reqid) {
                 break;
-            }
-
-            /*
-             * t4 near-critical first + reserve 策略：
-             * predicted-critical 只需要保证 victim 不超过 deadline；
-             * predicted-noncritical 还必须给后续可能到来的 critical read
-             * 预留至少一个 read_delay 的 residual slack。
-             */
-            if (critical_reserve && !sample->pred_critical) {
-                required_slack += sample->read_delay;
             }
 
             if (victim->slack < required_slack) {
@@ -641,7 +1642,6 @@ static uint64_t zns_read_bypass_execute(uint64_t reqid, uint64_t subidx,
         }
     }
 
-skip_bypass_scan:
     if (hops) {
         uint64_t queue_len_before = queue->len;
 
@@ -745,6 +1745,210 @@ skip_bypass_scan:
              sample->ppa.g.blk, sample->ppa.g.pg, sample->ppa.g.spg);
 
     return finish - read_stime;
+}
+
+/*
+ * dynamic execute：以整条 host read 的 maxlat 为目标。
+ *
+ * 当前版本围绕关键/近关键 subop 构造一个同 plane block。默认 prefix 模式
+ * 仍然使用“target 以及它前面尚未调度的同 plane sibling”这个完整前缀 block；
+ * 若开启 variants 模式，则会同时尝试 [C] / [B C] / [A B C] 这类不同大小的
+ * suffix/prefix 变体，再按 host_gain、block_count、cost、gap 选最优。
+ *
+ * prefix block 可以处理：
+ *
+ *   A B C  ->  B C A
+ *
+ * C 是关键，B slack 小导致 C 单独绕不过；但 [B C] 整体可以绕过 slack
+ * 充足的 A，从而让 C 也提前。
+ *
+ * 为避免追着关键路径反复调整，第一版每条 host read 最多 commit 一次
+ * 最优 block move。后续实验可以通过 FEMU_ZNS_READ_BYPASS_DYNAMIC_MAX_ROUNDS
+ * 把这个上限提高到 2/3，做 bounded multi-round dynamic。
+ */
+static void zns_read_bypass_execute_dynamic(
+    uint64_t reqid, struct zns_ssd *zns,
+    struct zns_read_slack_sample *samples, uint64_t sample_cnt,
+    uint64_t read_stime, uint64_t req_deadline)
+{
+    bool *scheduled;
+    uint64_t *model_finish;
+    uint64_t initial_maxlat;
+    uint64_t old_maxlat;
+    uint64_t final_maxlat;
+    uint64_t rounds = 0;
+    uint64_t probed_subops = 0;
+    uint64_t committed_subops = 0;
+    uint64_t total_host_gain = 0;
+    uint64_t critical_shift_count = 0;
+    uint64_t max_rounds = zns_read_bypass_get_dynamic_max_rounds();
+    uint64_t limit_next_gain = 0;
+    uint64_t limit_next_block_count = 0;
+    uint64_t limit_next_victim_count = 0;
+    uint64_t limit_next_cost = 0;
+    uint64_t limit_next_target_idx = UINT64_MAX;
+    uint64_t limit_next_gap = 0;
+    bool stopped_by_max_rounds = false;
+    struct zns_read_bypass_dynamic_funnel funnel = { 0 };
+    uint64_t i;
+
+    if (!sample_cnt) {
+        return;
+    }
+
+    scheduled = g_malloc0(sizeof(*scheduled) * sample_cnt);
+    model_finish = g_malloc0(sizeof(*model_finish) * sample_cnt);
+
+    zns_read_bypass_refresh_dynamic_model(zns, samples, sample_cnt,
+                                          scheduled, read_stime,
+                                          model_finish);
+    initial_maxlat = zns_read_bypass_model_maxlat(model_finish, sample_cnt,
+                                                  read_stime);
+
+    while (committed_subops < sample_cnt && rounds < max_rounds) {
+        struct zns_read_bypass_block_probe best_probe = { 0 };
+        uint64_t best_gain = 0;
+        uint64_t best_gap = 0;
+        uint64_t best_cost = 0;
+        uint64_t best_block_count = 0;
+        bool found;
+
+        old_maxlat = zns_read_bypass_model_maxlat(model_finish, sample_cnt,
+                                                  read_stime);
+        found = zns_read_bypass_find_best_dynamic_probe(
+            reqid, zns, samples, sample_cnt, scheduled, model_finish,
+            read_stime, &best_probe, &best_gain, &best_cost, &best_gap,
+            &best_block_count, &probed_subops, &funnel, true);
+
+        if (!found) {
+            break;
+        }
+
+        rounds++;
+        zns_read_bypass_commit_block_probe(reqid, zns, samples, scheduled,
+                                           read_stime, req_deadline,
+                                           &best_probe);
+        committed_subops += best_probe.block_count;
+        total_host_gain += best_gain;
+
+        ftl_log("ZNS_READ_BYPASS_DYNAMIC_BLOCK,reqid=%lu,round=%lu,"
+                "target_subidx=%lu,block_start_subidx=%lu,target_lpn=%lu,"
+                "block_count=%lu,"
+                "victim_count=%lu,block_delay_ns=%lu,old_maxlat_ns=%lu,"
+                "new_maxlat_ns=%lu,host_gain_ns=%lu,cost_ns=%lu,"
+                "pred_critical_gap_ns=%lu,critical_set_size=%lu,"
+                "critical_set_covered=%lu,critical_set_gain_ns=%lu,"
+                "critical_set_remaining_max_ns=%lu,"
+                "victim_cost_ns=%lu,critical_set_net_score_ns=%ld,"
+                "critset_cost_aware=%u,"
+                "critset_cost_alpha_milli=%lu\n",
+                reqid, rounds, best_probe.target_idx,
+                best_probe.block_start_idx,
+                samples[best_probe.target_idx].lpn, best_probe.block_count,
+                best_probe.victim_count, best_probe.block_delay,
+                old_maxlat, old_maxlat - best_gain, best_gain,
+                best_cost, samples[best_probe.target_idx].pred_critical_gap,
+                best_probe.critset_size, best_probe.critset_covered,
+                best_probe.critset_gain, best_probe.critset_remaining_max,
+                best_probe.victim_cost, best_probe.critset_net_score,
+                zns_read_bypass_dynamic_critset_cost_aware_enabled() ? 1 : 0,
+                zns_read_bypass_get_dynamic_critset_cost_alpha_milli());
+
+        zns_read_bypass_refresh_dynamic_model(zns, samples, sample_cnt,
+                                              scheduled, read_stime,
+                                              model_finish);
+        final_maxlat = zns_read_bypass_model_maxlat(model_finish, sample_cnt,
+                                                    read_stime);
+        for (i = 0; i < sample_cnt; i++) {
+            if (model_finish[i] - read_stime == final_maxlat) {
+                if (i != best_probe.target_idx) {
+                    critical_shift_count++;
+                }
+                break;
+            }
+        }
+    }
+
+    if (rounds >= max_rounds && committed_subops < sample_cnt) {
+        struct zns_read_bypass_block_probe next_probe = { 0 };
+        uint64_t diag_probed_subops = 0;
+        uint64_t next_block_count = 0;
+
+        stopped_by_max_rounds = true;
+        if (zns_read_bypass_find_best_dynamic_probe(
+                reqid, zns, samples, sample_cnt, scheduled, model_finish,
+                read_stime, &next_probe, &limit_next_gain,
+                &limit_next_cost, &limit_next_gap, &next_block_count,
+                &diag_probed_subops, NULL, false)) {
+            limit_next_block_count = next_probe.block_count;
+            limit_next_victim_count = next_probe.victim_count;
+            limit_next_target_idx = next_probe.target_idx;
+            ftl_log("ZNS_READ_BYPASS_DYNAMIC_LIMIT_NEXT,reqid=%lu,"
+                    "max_rounds=%lu,rounds=%lu,target_subidx=%lu,"
+                    "block_start_subidx=%lu,"
+                    "block_count=%lu,victim_count=%lu,host_gain_ns=%lu,"
+                    "cost_ns=%lu,pred_critical_gap_ns=%lu,"
+                    "diag_probed_subops=%lu\n",
+                    reqid, max_rounds, rounds, limit_next_target_idx,
+                    next_probe.block_start_idx,
+                    limit_next_block_count, limit_next_victim_count,
+                    limit_next_gain, limit_next_cost, limit_next_gap,
+                    diag_probed_subops);
+        }
+    }
+
+    /*
+     * 还没有被 dynamic commit 的 subop 按当前队列顺序接到队尾。它们不再尝试
+     * bypass，因为前面的循环已经证明没有 host-level gain。
+     */
+    for (i = 0; i < sample_cnt; i++) {
+        if (!scheduled[i]) {
+            zns_read_bypass_append_subop(reqid, i, zns, &samples[i],
+                                         read_stime, req_deadline);
+            scheduled[i] = true;
+        }
+    }
+
+    final_maxlat = 0;
+    for (i = 0; i < sample_cnt; i++) {
+        uint64_t sublat = samples[i].exec_finish - read_stime;
+        final_maxlat = (sublat > final_maxlat) ? sublat : final_maxlat;
+    }
+
+    ftl_log("ZNS_READ_BYPASS_DYNAMIC_SUMMARY,reqid=%lu,subops=%lu,"
+            "rounds=%lu,probed_subops=%lu,committed_subops=%lu,"
+            "initial_maxlat_ns=%lu,final_maxlat_ns=%lu,total_host_gain_ns=%lu,"
+            "critical_shift_count=%lu,max_rounds=%lu,stopped_by_max_rounds=%u,"
+            "limit_next_host_gain_ns=%lu,limit_next_target_subidx=%lu,"
+            "limit_next_block_count=%lu,limit_next_victim_count=%lu,"
+            "limit_next_cost_ns=%lu,limit_next_pred_critical_gap_ns=%lu\n",
+            reqid, sample_cnt, rounds, probed_subops, committed_subops,
+            initial_maxlat, final_maxlat, total_host_gain,
+            critical_shift_count, max_rounds, stopped_by_max_rounds ? 1 : 0,
+            limit_next_gain, limit_next_target_idx, limit_next_block_count,
+            limit_next_victim_count, limit_next_cost, limit_next_gap);
+
+    ftl_log("ZNS_READ_BYPASS_DYNAMIC_FUNNEL,reqid=%lu,subops=%lu,"
+            "max_rounds=%lu,rounds=%lu,target_subops=%lu,"
+            "reject_noncritical_gap=%lu,near_critical_targets=%lu,"
+            "reject_no_queue=%lu,reject_empty_queue=%lu,"
+            "reject_tail_not_ready=%lu,reject_same_req_tail=%lu,"
+            "queue_candidate_targets=%lu,reject_same_req_blocker=%lu,"
+            "reject_slack_insufficient=%lu,valid_block_targets=%lu,"
+            "reject_no_host_gain=%lu,positive_gain_targets=%lu,"
+            "committed_blocks=%lu,committed_subops=%lu,"
+            "total_host_gain_ns=%lu\n",
+            reqid, sample_cnt, max_rounds, rounds, funnel.target_subops,
+            funnel.reject_noncritical_gap, funnel.near_critical_targets,
+            funnel.reject_no_queue, funnel.reject_empty_queue,
+            funnel.reject_tail_not_ready, funnel.reject_same_req_tail,
+            funnel.queue_candidate_targets, funnel.reject_same_req_blocker,
+            funnel.reject_slack_insufficient, funnel.valid_block_targets,
+            funnel.reject_no_host_gain, funnel.positive_gain_targets, rounds,
+            committed_subops, total_host_gain);
+
+    g_free(model_finish);
+    g_free(scheduled);
 }
 
 /*
@@ -1075,6 +2279,7 @@ static uint64_t zns_read(struct zns_ssd *zns, NvmeRequest *req)
     uint64_t sumlat = 0; 
     uint64_t reqid = 0;
     bool exec_enabled = zns_read_bypass_exec_enabled();
+    enum zns_read_bypass_policy policy = zns_read_bypass_get_policy();
     struct zns_read_slack_sample *samples;
 
     samples = g_malloc0(sizeof(*samples) * nr_lpn);
@@ -1209,9 +2414,17 @@ static uint64_t zns_read(struct zns_ssd *zns, NvmeRequest *req)
      * baseline 模式继续走原来的 zns_advance_status()；
      * execute 模式则真正使用 read-read bypass 队列调度。
      */
+    if (sample_cnt && exec_enabled &&
+        policy == ZNS_READ_BYPASS_POLICY_DYNAMIC) {
+        zns_read_bypass_execute_dynamic(reqid, zns, samples, sample_cnt,
+                                        read_stime, read_stime + est_maxlat);
+    }
+
     for (uint64_t i = 0; i < sample_cnt; i++) {
         ppa = samples[i].ppa;
-        if (exec_enabled) {
+        if (exec_enabled && policy == ZNS_READ_BYPASS_POLICY_DYNAMIC) {
+            sublat = samples[i].exec_finish - read_stime;
+        } else if (exec_enabled) {
             /*
              * est_maxlat 是“不做当前 read 绕行时”的 baseline host 完成时间。
              * execute 原型可以让 incoming read 更早完成，但前序 victim 最晚
