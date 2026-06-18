@@ -923,6 +923,7 @@ static uint16_t zns_nvme_rw(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     if (status) {
         goto err;
     }
+    req->zns_zone_idx = zns_zone_idx(ns, slba);
 
     if(req->is_write)
     {
@@ -984,7 +985,7 @@ static uint16_t zns_nvme_rw(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
         zns_finalize_zoned_write(ns, req, false);
     }
 
-    n->zns->active_zone = zns_zone_idx(ns,slba);
+    n->zns->active_zone = req->zns_zone_idx;
     return NVME_SUCCESS;
 err:
     return status | NVME_DNR;

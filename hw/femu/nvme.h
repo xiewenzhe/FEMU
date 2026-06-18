@@ -990,6 +990,7 @@ typedef struct NvmeRequest {
     uint64_t predef;
 
     /* ZNS */
+    uint32_t                zns_zone_idx;
     void                    *opaque;
 
     /* position in the priority queue for delay emulation */
