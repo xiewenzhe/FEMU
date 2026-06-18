@@ -115,10 +115,6 @@ static uint64_t zns_read_slack_reqid;
 static struct zns_read_bypass_queue zns_read_bypass_queues[ZNS_BYPASS_MAX_PLANES];
 static bool zns_read_bypass_exec_flag_loaded;
 static bool zns_read_bypass_exec_flag;
-static bool zns_read_bypass_critical_only_flag_loaded;
-static bool zns_read_bypass_critical_only_flag;
-static bool zns_read_bypass_critical_reserve_flag_loaded;
-static bool zns_read_bypass_critical_reserve_flag;
 
 static inline uint64_t zns_absdiff_u64(uint64_t a, uint64_t b)
 {
@@ -145,61 +141,6 @@ static bool zns_read_bypass_exec_enabled(void)
     }
 
     return zns_read_bypass_exec_flag;
-}
-
-/*
- * critical-only 原型开关：
- *   unset 或 0：保持 naive execute，所有满足 slack 条件的 read subop 都可尝试绕行；
- *   1/true/on：只有在线估计为 predicted-critical 的 read subop 才允许真正绕行。
- *
- * 注意：非 critical subop 仍会被标记为 candidate，便于实验中统计“原本有多少
- * naive 机会被 critical-only 策略挡住”。
- */
-static bool zns_read_bypass_critical_only_enabled(void)
-{
-    const char *value;
-
-    if (!zns_read_bypass_critical_only_flag_loaded) {
-        value = g_getenv("FEMU_ZNS_READ_BYPASS_CRITICAL_ONLY");
-        zns_read_bypass_critical_only_flag =
-            value &&
-            (!g_ascii_strcasecmp(value, "1") ||
-             !g_ascii_strcasecmp(value, "true") ||
-             !g_ascii_strcasecmp(value, "on"));
-        zns_read_bypass_critical_only_flag_loaded = true;
-    }
-
-    return zns_read_bypass_critical_only_flag;
-}
-
-/*
- * near-critical first + slack reserve 原型开关：
- *   unset 或 0：不保留额外 slack，维持当前 execute 策略；
- *   1/true/on：predicted-noncritical 只有在 victim 被后移后仍至少剩下
- *              一个 read_delay slack 时才允许绕过。
- *
- * 换句话说：
- *   - predicted-critical:    victim_slack >= read_delay 即可绕过；
- *   - predicted-noncritical: victim_slack >= 2 * read_delay 才可绕过。
- *
- * 这样 noncritical 不是完全禁止，而是在不吃掉 critical reserve 的前提下
- * 才能利用 slack。
- */
-static bool zns_read_bypass_critical_reserve_enabled(void)
-{
-    const char *value;
-
-    if (!zns_read_bypass_critical_reserve_flag_loaded) {
-        value = g_getenv("FEMU_ZNS_READ_BYPASS_CRITICAL_RESERVE");
-        zns_read_bypass_critical_reserve_flag =
-            value &&
-            (!g_ascii_strcasecmp(value, "1") ||
-             !g_ascii_strcasecmp(value, "true") ||
-             !g_ascii_strcasecmp(value, "on"));
-        zns_read_bypass_critical_reserve_flag_loaded = true;
-    }
-
-    return zns_read_bypass_critical_reserve_flag;
 }
 
 /* 在当前 host read 的 shadow plane 表里查找某个 PPA 对应的 plane。 */
@@ -564,8 +505,6 @@ static uint64_t zns_read_bypass_execute(uint64_t reqid, uint64_t subidx,
     uint64_t hops = 0;
     uint64_t insertion_pos = 0;
     uint64_t pos;
-    bool critical_only = zns_read_bypass_critical_only_enabled();
-    bool critical_reserve = zns_read_bypass_critical_reserve_enabled();
 
     if (!queue) {
         /*
@@ -594,16 +533,6 @@ static uint64_t zns_read_bypass_execute(uint64_t reqid, uint64_t subidx,
         sample->exec_candidate = true;
 
         /*
-         * t3 critical-only 策略：非 predicted-critical subop 只记录为
-         * candidate，不真正前移。这样可以和 t2 naive execute 对比：
-         *   - candidate_subops 仍表示原始连续队列机会；
-         *   - executed_subops 表示 critical-only 策略实际放行的机会。
-         */
-        if (critical_only && !sample->pred_critical) {
-            goto skip_bypass_scan;
-        }
-
-        /*
          * 从队尾向队头扫描。只要 victim 仍有足够 slack，就继续前移。
          * 如果遇到同一条 host read 内更早的子请求，也停止，避免 sibling
          * subop 在 execute 原型里互相穿插。
@@ -614,16 +543,6 @@ static uint64_t zns_read_bypass_execute(uint64_t reqid, uint64_t subidx,
 
             if (victim->reqid == reqid) {
                 break;
-            }
-
-            /*
-             * t4 near-critical first + reserve 策略：
-             * predicted-critical 只需要保证 victim 不超过 deadline；
-             * predicted-noncritical 还必须给后续可能到来的 critical read
-             * 预留至少一个 read_delay 的 residual slack。
-             */
-            if (critical_reserve && !sample->pred_critical) {
-                required_slack += sample->read_delay;
             }
 
             if (victim->slack < required_slack) {
@@ -641,7 +560,6 @@ static uint64_t zns_read_bypass_execute(uint64_t reqid, uint64_t subidx,
         }
     }
 
-skip_bypass_scan:
     if (hops) {
         uint64_t queue_len_before = queue->len;
 
