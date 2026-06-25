@@ -1,0 +1,78 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="620" viewBox="0 0 1200 620">
+  <rect width="1200" height="620" fill="#fbfbf8"/>
+  <style>
+    text { font-family: "Noto Sans CJK SC", "Microsoft YaHei", Arial, sans-serif; fill: #1d242b; }
+    .title { font-size: 30px; font-weight: 700; }
+    .subtitle { font-size: 18px; fill: #42505c; }
+    .axis { stroke: #26323b; stroke-width: 2; }
+    .grid { stroke: #d9dedf; stroke-width: 1; }
+    .tick { font-size: 15px; fill: #4d5a64; }
+    .lane { font-size: 20px; font-weight: 700; }
+    .label { font-size: 16px; font-weight: 700; }
+    .small { font-size: 14px; fill: #3e4a53; }
+    .a { fill: #ffbc75; stroke: #7b3f00; stroke-width: 2; }
+    .b { fill: #7cc7f2; stroke: #0a4d73; stroke-width: 2; }
+    .busy { fill: #c6ccd1; stroke: #68747c; stroke-width: 2; }
+    .slack { fill: #ffe1ac; stroke: #9b6b00; stroke-width: 2; stroke-dasharray: 7 5; }
+    .gain { fill: #c7f2ce; stroke: #167a2e; stroke-width: 2; }
+    .arrow { stroke: #d71920; stroke-width: 3; marker-end: url(#arrowRed); }
+    .greenArrow { stroke: #167a2e; stroke-width: 3; marker-end: url(#arrowGreen); }
+  </style>
+  <defs>
+    <marker id="arrowRed" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,6 L9,3 z" fill="#d71920"/></marker>
+    <marker id="arrowGreen" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,6 L9,3 z" fill="#167a2e"/></marker>
+  </defs>
+
+  <text x="60" y="54" class="title">图2：执行读绕过后，B0 消耗 A0 slack 前插</text>
+  <text x="60" y="84" class="subtitle">B0 从 122-154us 提前到 90-122us；A0 被推迟到 122-154us，但仍早于 A 的 212us deadline。</text>
+
+  <line x1="120" y1="520" x2="1020" y2="520" class="axis"/>
+  <text x="1040" y="526" class="small">时间/us</text>
+  <line x1="120" y1="130" x2="120" y2="520" class="axis"/>
+  <text x="45" y="155" class="lane">P0</text>
+  <text x="45" y="275" class="lane">P1</text>
+  <text x="45" y="395" class="lane">P2</text>
+
+  <g>
+    <line x1="120" y1="120" x2="120" y2="525" class="grid"/><text x="112" y="550" class="tick">0</text>
+    <line x1="280" y1="120" x2="280" y2="525" class="grid"/><text x="268" y="550" class="tick">40</text>
+    <line x1="480" y1="120" x2="480" y2="525" class="grid"/><text x="464" y="550" class="tick">90</text>
+    <line x1="608" y1="120" x2="608" y2="525" class="grid"/><text x="592" y="550" class="tick">122</text>
+    <line x1="736" y1="120" x2="736" y2="525" class="grid"/><text x="720" y="550" class="tick">154</text>
+    <line x1="840" y1="120" x2="840" y2="525" class="grid"/><text x="824" y="550" class="tick">180</text>
+    <line x1="968" y1="120" x2="968" y2="525" class="grid"/><text x="952" y="550" class="tick">212</text>
+  </g>
+
+  <line x1="120" y1="105" x2="120" y2="135" class="arrow"/>
+  <text x="82" y="100" class="label">A 到达</text>
+  <line x1="280" y1="105" x2="280" y2="135" class="arrow"/>
+  <text x="245" y="100" class="label">B 到达</text>
+
+  <line x1="120" y1="170" x2="1020" y2="170" class="axis" opacity="0.35"/>
+  <line x1="120" y1="290" x2="1020" y2="290" class="axis" opacity="0.35"/>
+  <line x1="120" y1="410" x2="1020" y2="410" class="axis" opacity="0.35"/>
+
+  <rect x="120" y="145" width="360" height="50" class="busy"/>
+  <text x="255" y="176" class="label">前序忙碌</text>
+  <rect x="480" y="145" width="128" height="50" class="b"/>
+  <text x="522" y="176" class="label">B0</text>
+  <rect x="608" y="145" width="128" height="50" class="a"/>
+  <text x="650" y="176" class="label">A0</text>
+  <rect x="736" y="205" width="232" height="28" class="slack"/>
+  <text x="785" y="225" class="small">A0 剩余 slack = 58us</text>
+  <rect x="608" y="250" width="128" height="30" class="gain"/>
+  <text x="616" y="271" class="small">B0 提前 32us</text>
+  <line x1="736" y1="250" x2="608" y2="250" class="greenArrow"/>
+
+  <rect x="120" y="265" width="128" height="50" class="a"/>
+  <text x="162" y="296" class="label">A1</text>
+  <rect x="120" y="385" width="720" height="50" class="busy"/>
+  <text x="430" y="416" class="label">前序忙碌</text>
+  <rect x="840" y="385" width="128" height="50" class="a"/>
+  <text x="882" y="416" class="label">A2</text>
+  <line x1="968" y1="360" x2="968" y2="385" class="arrow"/>
+  <text x="922" y="350" class="label">A 的 deadline</text>
+
+  <rect x="60" y="575" width="1080" height="34" rx="4" fill="#eef3f6" stroke="#c7d3da"/>
+  <text x="75" y="598" class="small">绕过后：A 仍然等 A2 到 212us，所以 A 不变；B0 借用 A0 的 32us slack 提前执行。</text>
+</svg>

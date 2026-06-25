@@ -1,0 +1,102 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="620" viewBox="0 0 1200 620">
+  <rect width="1200" height="620" fill="#fbfbf8"/>
+  <style>
+    text { font-family: Arial, Helvetica, sans-serif; fill: #1d242b; }
+    .title { font-size: 30px; font-weight: 700; }
+    .subtitle { font-size: 18px; fill: #42505c; }
+    .axis { stroke: #26323b; stroke-width: 2; }
+    .grid { stroke: #d9dedf; stroke-width: 1; }
+    .tick { font-size: 15px; fill: #4d5a64; }
+    .lane { font-size: 20px; font-weight: 700; }
+    .label { font-size: 16px; font-weight: 700; }
+    .small { font-size: 14px; fill: #3e4a53; }
+    .a { fill: #ffbc75; stroke: #7b3f00; stroke-width: 2; }
+    .b { fill: #7cc7f2; stroke: #0a4d73; stroke-width: 2; }
+    .busy { fill: #c6ccd1; stroke: #68747c; stroke-width: 2; }
+    .slack { fill: #ffe1ac; stroke: #9b6b00; stroke-width: 2; stroke-dasharray: 7 5; }
+    .arrow { stroke: #d71920; stroke-width: 3; marker-end: url(#arrowRed); }
+    .dash { stroke: #6a4b00; stroke-width: 2; stroke-dasharray: 6 5; marker-end: url(#arrowDark); marker-start: url(#arrowDarkStart); }
+  </style>
+  <defs>
+    <marker id="arrowRed" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#d71920"/>
+    </marker>
+    <marker id="arrowDark" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#6a4b00"/>
+    </marker>
+    <marker id="arrowDarkStart" markerWidth="10" markerHeight="10" refX="1" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M9,0 L9,6 L0,3 z" fill="#6a4b00"/>
+    </marker>
+  </defs>
+
+  <text x="60" y="54" class="title">Baseline: slack-unaware scheduling</text>
+  <text x="60" y="84" class="subtitle">A arrives first. B0 waits behind A0 on the same plane P0, even though A0 has 90us slack.</text>
+
+  <!-- scale: x = 120 + t_us*4 -->
+  <line x1="120" y1="520" x2="1020" y2="520" class="axis"/>
+  <text x="1040" y="526" class="small">time</text>
+  <line x1="120" y1="130" x2="120" y2="520" class="axis"/>
+  <text x="45" y="155" class="lane">P0</text>
+  <text x="45" y="275" class="lane">P1</text>
+  <text x="45" y="395" class="lane">P2</text>
+
+  <!-- vertical grid/ticks every 20us from 0 to 220 -->
+  <g>
+    <line x1="120" y1="120" x2="120" y2="525" class="grid"/><text x="112" y="550" class="tick">0</text>
+    <line x1="200" y1="120" x2="200" y2="525" class="grid"/><text x="188" y="550" class="tick">20</text>
+    <line x1="280" y1="120" x2="280" y2="525" class="grid"/><text x="268" y="550" class="tick">40</text>
+    <line x1="360" y1="120" x2="360" y2="525" class="grid"/><text x="348" y="550" class="tick">60</text>
+    <line x1="440" y1="120" x2="440" y2="525" class="grid"/><text x="428" y="550" class="tick">80</text>
+    <line x1="520" y1="120" x2="520" y2="525" class="grid"/><text x="504" y="550" class="tick">100</text>
+    <line x1="600" y1="120" x2="600" y2="525" class="grid"/><text x="584" y="550" class="tick">120</text>
+    <line x1="680" y1="120" x2="680" y2="525" class="grid"/><text x="664" y="550" class="tick">140</text>
+    <line x1="760" y1="120" x2="760" y2="525" class="grid"/><text x="744" y="550" class="tick">160</text>
+    <line x1="840" y1="120" x2="840" y2="525" class="grid"/><text x="824" y="550" class="tick">180</text>
+    <line x1="920" y1="120" x2="920" y2="525" class="grid"/><text x="904" y="550" class="tick">200</text>
+    <line x1="968" y1="120" x2="968" y2="525" class="grid"/><text x="952" y="550" class="tick">212</text>
+  </g>
+
+  <!-- arrivals -->
+  <line x1="120" y1="105" x2="120" y2="135" class="arrow"/>
+  <text x="82" y="100" class="label">A arrives 0us</text>
+  <line x1="280" y1="105" x2="280" y2="135" class="arrow"/>
+  <text x="245" y="100" class="label">B arrives 40us</text>
+
+  <!-- lane baselines -->
+  <line x1="120" y1="170" x2="1020" y2="170" class="axis" opacity="0.35"/>
+  <line x1="120" y1="290" x2="1020" y2="290" class="axis" opacity="0.35"/>
+  <line x1="120" y1="410" x2="1020" y2="410" class="axis" opacity="0.35"/>
+
+  <!-- P0 previous busy, A0, B0 -->
+  <rect x="120" y="145" width="360" height="50" class="busy"/>
+  <text x="255" y="176" class="label">old busy</text>
+  <rect x="480" y="145" width="128" height="50" class="a"/>
+  <text x="522" y="176" class="label">A0</text>
+  <rect x="608" y="145" width="128" height="50" class="b"/>
+  <text x="650" y="176" class="label">B0</text>
+  <rect x="608" y="205" width="360" height="28" class="slack"/>
+  <text x="720" y="225" class="small">A0 slack before B = 90us (122 to 212)</text>
+  <line x1="608" y1="242" x2="968" y2="242" class="dash"/>
+
+  <!-- P1 A1 -->
+  <rect x="120" y="265" width="128" height="50" class="a"/>
+  <text x="162" y="296" class="label">A1</text>
+  <rect x="248" y="325" width="720" height="28" class="slack"/>
+  <text x="510" y="345" class="small">A1 slack = 180us</text>
+
+  <!-- P2 old busy and A2 critical -->
+  <rect x="120" y="385" width="720" height="50" class="busy"/>
+  <text x="430" y="416" class="label">old busy</text>
+  <rect x="840" y="385" width="128" height="50" class="a"/>
+  <text x="882" y="416" class="label">A2</text>
+  <text x="820" y="466" class="label">A completes at 212us because A2 is critical</text>
+  <line x1="968" y1="360" x2="968" y2="385" class="arrow"/>
+  <text x="934" y="350" class="label">A deadline</text>
+
+  <!-- B baseline complete -->
+  <line x1="736" y1="120" x2="736" y2="145" class="arrow"/>
+  <text x="690" y="112" class="label">B0 baseline finish 154us</text>
+
+  <rect x="60" y="575" width="1080" height="34" rx="4" fill="#eef3f6" stroke="#c7d3da"/>
+  <text x="75" y="598" class="small">Baseline on P0: A0 runs 90-122us, then B0 runs 122-154us. A0 has slack because A waits for A2 until 212us.</text>
+</svg>

@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="620" viewBox="0 0 1200 620">
+  <rect width="1200" height="620" fill="#fbfbf8"/>
+  <style>
+    text { font-family: Arial, Helvetica, sans-serif; fill: #1d242b; }
+    .title { font-size: 30px; font-weight: 700; }
+    .subtitle { font-size: 18px; fill: #42505c; }
+    .head { font-size: 18px; font-weight: 700; }
+    .cell { font-size: 16px; }
+    .small { font-size: 14px; fill: #3e4a53; }
+    .panel { fill: #ffffff; stroke: #c7d3da; stroke-width: 2; rx: 8; }
+    .blue { fill: #7cc7f2; stroke: #0a4d73; stroke-width: 2; }
+    .orange { fill: #ffbc75; stroke: #7b3f00; stroke-width: 2; }
+    .green { fill: #c7f2ce; stroke: #167a2e; stroke-width: 2; }
+    .grid { stroke: #c7d3da; stroke-width: 1.5; }
+  </style>
+
+  <text x="60" y="54" class="title">What improves, and what stays safe?</text>
+  <text x="60" y="84" class="subtitle">B improves only if the bypassed subop is on B's host-level critical path. A stays safe because A0 remains before A deadline.</text>
+
+  <rect x="60" y="120" width="1080" height="250" class="panel"/>
+  <text x="90" y="155" class="head">Sub-request timing table</text>
+  <line x1="90" y1="180" x2="1110" y2="180" class="grid"/>
+  <line x1="90" y1="225" x2="1110" y2="225" class="grid"/>
+  <line x1="90" y1="270" x2="1110" y2="270" class="grid"/>
+  <line x1="90" y1="315" x2="1110" y2="315" class="grid"/>
+  <line x1="260" y1="180" x2="260" y2="345" class="grid"/>
+  <line x1="470" y1="180" x2="470" y2="345" class="grid"/>
+  <line x1="700" y1="180" x2="700" y2="345" class="grid"/>
+  <line x1="910" y1="180" x2="910" y2="345" class="grid"/>
+
+  <text x="110" y="210" class="head">Subop</text>
+  <text x="290" y="210" class="head">Baseline</text>
+  <text x="500" y="210" class="head">Bypass execute</text>
+  <text x="730" y="210" class="head">Effect</text>
+  <text x="940" y="210" class="head">Why safe?</text>
+
+  <text x="110" y="255" class="cell">A0 on P0</text>
+  <text x="290" y="255" class="cell">90-122us</text>
+  <text x="500" y="255" class="cell">122-154us</text>
+  <text x="730" y="255" class="cell">delayed 32us</text>
+  <text x="940" y="255" class="cell">154 &lt; A deadline 212</text>
+
+  <text x="110" y="300" class="cell">A2 on P2</text>
+  <text x="290" y="300" class="cell">180-212us</text>
+  <text x="500" y="300" class="cell">180-212us</text>
+  <text x="730" y="300" class="cell">unchanged</text>
+  <text x="940" y="300" class="cell">still A critical path</text>
+
+  <text x="110" y="345" class="cell">B0 on P0</text>
+  <text x="290" y="345" class="cell">122-154us</text>
+  <text x="500" y="345" class="cell">90-122us</text>
+  <text x="730" y="345" class="cell">saves 32us</text>
+  <text x="940" y="345" class="cell">uses A0 slack</text>
+
+  <rect x="60" y="405" width="515" height="145" class="panel"/>
+  <text x="90" y="440" class="head">A host read</text>
+  <rect x="90" y="465" width="420" height="36" class="orange"/>
+  <text x="110" y="489" class="cell">Baseline max(A0=122, A1=32, A2=212) = 212us</text>
+  <rect x="90" y="510" width="420" height="36" class="orange"/>
+  <text x="110" y="534" class="cell">Bypass max(A0=154, A1=32, A2=212) = 212us</text>
+
+  <rect x="625" y="405" width="515" height="145" class="panel"/>
+  <text x="655" y="440" class="head">B host read, if B0 is critical</text>
+  <rect x="655" y="465" width="420" height="36" class="blue"/>
+  <text x="675" y="489" class="cell">Baseline max(B0=114, B1=32, B2=42) = 114us</text>
+  <rect x="655" y="510" width="420" height="36" class="green"/>
+  <text x="675" y="534" class="cell">Bypass max(B0=82, B1=32, B2=42) = 82us</text>
+
+  <rect x="60" y="575" width="1080" height="34" rx="4" fill="#eef3f6" stroke="#c7d3da"/>
+  <text x="75" y="598" class="small">Key lesson: subop benefit becomes host benefit only when that subop affects the host read maxlat.</text>
+</svg>

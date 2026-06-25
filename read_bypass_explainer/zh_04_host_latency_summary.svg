@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="620" viewBox="0 0 1200 620">
+  <rect width="1200" height="620" fill="#fbfbf8"/>
+  <style>
+    text { font-family: "Noto Sans CJK SC", "Microsoft YaHei", Arial, sans-serif; fill: #1d242b; }
+    .title { font-size: 30px; font-weight: 700; }
+    .subtitle { font-size: 18px; fill: #42505c; }
+    .head { font-size: 18px; font-weight: 700; }
+    .cell { font-size: 16px; }
+    .small { font-size: 14px; fill: #3e4a53; }
+    .panel { fill: #ffffff; stroke: #c7d3da; stroke-width: 2; rx: 8; }
+    .blue { fill: #7cc7f2; stroke: #0a4d73; stroke-width: 2; }
+    .orange { fill: #ffbc75; stroke: #7b3f00; stroke-width: 2; }
+    .green { fill: #c7f2ce; stroke: #167a2e; stroke-width: 2; }
+    .grid { stroke: #c7d3da; stroke-width: 1.5; }
+  </style>
+
+  <text x="60" y="54" class="title">图4：子请求提前，什么时候能变成 host 请求变快？</text>
+  <text x="60" y="84" class="subtitle">A 安全不变；B 只有当 B0 是 B 的关键路径时，整条 host read latency 才会下降。</text>
+
+  <rect x="60" y="120" width="1080" height="250" class="panel"/>
+  <text x="90" y="155" class="head">子请求时间对比</text>
+  <line x1="90" y1="180" x2="1110" y2="180" class="grid"/>
+  <line x1="90" y1="225" x2="1110" y2="225" class="grid"/>
+  <line x1="90" y1="270" x2="1110" y2="270" class="grid"/>
+  <line x1="90" y1="315" x2="1110" y2="315" class="grid"/>
+  <line x1="260" y1="180" x2="260" y2="345" class="grid"/>
+  <line x1="470" y1="180" x2="470" y2="345" class="grid"/>
+  <line x1="700" y1="180" x2="700" y2="345" class="grid"/>
+  <line x1="910" y1="180" x2="910" y2="345" class="grid"/>
+
+  <text x="110" y="210" class="head">子请求</text>
+  <text x="290" y="210" class="head">baseline</text>
+  <text x="500" y="210" class="head">绕过后</text>
+  <text x="730" y="210" class="head">变化</text>
+  <text x="940" y="210" class="head">为什么安全</text>
+
+  <text x="110" y="255" class="cell">A0 on P0</text>
+  <text x="290" y="255" class="cell">90-122us</text>
+  <text x="500" y="255" class="cell">122-154us</text>
+  <text x="730" y="255" class="cell">推迟 32us</text>
+  <text x="940" y="255" class="cell">154 &lt; A deadline 212</text>
+
+  <text x="110" y="300" class="cell">A2 on P2</text>
+  <text x="290" y="300" class="cell">180-212us</text>
+  <text x="500" y="300" class="cell">180-212us</text>
+  <text x="730" y="300" class="cell">不变</text>
+  <text x="940" y="300" class="cell">仍是 A 关键路径</text>
+
+  <text x="110" y="345" class="cell">B0 on P0</text>
+  <text x="290" y="345" class="cell">122-154us</text>
+  <text x="500" y="345" class="cell">90-122us</text>
+  <text x="730" y="345" class="cell">提前 32us</text>
+  <text x="940" y="345" class="cell">消耗 A0 slack</text>
+
+  <rect x="60" y="405" width="515" height="145" class="panel"/>
+  <text x="90" y="440" class="head">A 这条 host read</text>
+  <rect x="90" y="465" width="420" height="36" class="orange"/>
+  <text x="110" y="489" class="cell">baseline: max(A0=122, A1=32, A2=212) = 212us</text>
+  <rect x="90" y="510" width="420" height="36" class="orange"/>
+  <text x="110" y="534" class="cell">绕过后: max(A0=154, A1=32, A2=212) = 212us</text>
+
+  <rect x="625" y="405" width="515" height="145" class="panel"/>
+  <text x="655" y="440" class="head">B 这条 host read，假设 B0 是关键路径</text>
+  <rect x="655" y="465" width="420" height="36" class="blue"/>
+  <text x="675" y="489" class="cell">baseline: max(B0=114, B1=32, B2=42) = 114us</text>
+  <rect x="655" y="510" width="420" height="36" class="green"/>
+  <text x="675" y="534" class="cell">绕过后: max(B0=82, B1=32, B2=42) = 82us</text>
+
+  <rect x="60" y="575" width="1080" height="34" rx="4" fill="#eef3f6" stroke="#c7d3da"/>
+  <text x="75" y="598" class="small">关键结论：子请求提前不一定等于 host 请求变快；只有它影响 maxlat，整条 read 才会变快。</text>
+</svg>

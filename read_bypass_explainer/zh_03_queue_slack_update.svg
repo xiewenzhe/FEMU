@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="680" viewBox="0 0 1200 680">
+  <rect width="1200" height="680" fill="#fbfbf8"/>
+  <style>
+    text { font-family: "Noto Sans CJK SC", "Microsoft YaHei", Arial, sans-serif; fill: #1d242b; }
+    .title { font-size: 30px; font-weight: 700; }
+    .subtitle { font-size: 18px; fill: #42505c; }
+    .boxText { font-size: 17px; font-weight: 700; }
+    .small { font-size: 14px; fill: #3e4a53; }
+    .code { font-size: 15px; font-family: Consolas, Menlo, monospace; fill: #1d242b; }
+    .a { fill: #ffbc75; stroke: #7b3f00; stroke-width: 2; }
+    .b { fill: #7cc7f2; stroke: #0a4d73; stroke-width: 2; }
+    .panel { fill: #ffffff; stroke: #c7d3da; stroke-width: 2; rx: 8; }
+    .arrow { stroke: #26323b; stroke-width: 3; marker-end: url(#arrowDark); }
+    .ok { fill: #e6f6e8; stroke: #167a2e; stroke-width: 2; }
+  </style>
+  <defs>
+    <marker id="arrowDark" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,6 L9,3 z" fill="#26323b"/></marker>
+  </defs>
+
+  <text x="60" y="54" class="title">图3：代码内部的队列变化和 slack 扣减</text>
+  <text x="60" y="84" class="subtitle">对应 zns_read_bypass_execute()：先判断 candidate，再检查 slack，最后移动队列 entry。</text>
+
+  <rect x="60" y="120" width="500" height="220" class="panel"/>
+  <text x="85" y="155" class="boxText">B0 到达前：P0 队列</text>
+  <rect x="100" y="190" width="180" height="70" class="a"/>
+  <text x="130" y="217" class="boxText">A0 entry</text>
+  <text x="118" y="242" class="small">start 90, finish 122</text>
+  <text x="118" y="262" class="small">deadline 212, slack 90</text>
+  <text x="100" y="300" class="code">queue entries: [ A0 ]</text>
+
+  <rect x="640" y="120" width="500" height="220" class="panel"/>
+  <text x="665" y="155" class="boxText">candidate 判断</text>
+  <text x="685" y="198" class="code">baseline_start(B0) = max(P0_avail=122, B_arrive=40)</text>
+  <text x="685" y="222" class="code">                   = 122</text>
+  <text x="685" y="258" class="code">queue_tail.finish == baseline_start</text>
+  <text x="685" y="282" class="code">122 == 122  -> 是候选</text>
+  <rect x="680" y="300" width="300" height="28" class="ok"/>
+  <text x="696" y="320" class="small">A0 还没开始，而且正好排在 B0 前面</text>
+
+  <line x1="560" y1="230" x2="640" y2="230" class="arrow"/>
+
+  <rect x="60" y="390" width="500" height="220" class="panel"/>
+  <text x="85" y="425" class="boxText">slack 安全检查</text>
+  <text x="100" y="470" class="code">required_slack = B0.read_delay = 32us</text>
+  <text x="100" y="500" class="code">A0.slack = 90us</text>
+  <text x="100" y="530" class="code">90 >= 32  -> 允许绕过</text>
+  <rect x="100" y="555" width="350" height="32" class="ok"/>
+  <text x="118" y="577" class="small">A0 可以被推迟，但不能超过 A 的 deadline</text>
+
+  <rect x="640" y="390" width="500" height="220" class="panel"/>
+  <text x="665" y="425" class="boxText">插入后：P0 队列</text>
+  <rect x="690" y="465" width="170" height="70" class="b"/>
+  <text x="728" y="492" class="boxText">B0 entry</text>
+  <text x="708" y="517" class="small">start 90, finish 122</text>
+  <rect x="890" y="465" width="170" height="70" class="a"/>
+  <text x="928" y="492" class="boxText">A0 entry</text>
+  <text x="908" y="517" class="small">start 122, finish 154</text>
+  <text x="908" y="537" class="small">slack 58</text>
+  <text x="690" y="575" class="code">queue entries: [ B0, A0 ]</text>
+
+  <line x1="560" y1="500" x2="640" y2="500" class="arrow"/>
+
+  <rect x="60" y="630" width="1080" height="34" rx="4" fill="#eef3f6" stroke="#c7d3da"/>
+  <text x="75" y="653" class="small">对应代码：insertion_pos = queue_len - hops；victim.start/finish += read_delay；victim.slack -= read_delay。</text>
+</svg>
