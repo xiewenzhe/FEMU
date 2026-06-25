@@ -381,6 +381,72 @@ static uint64_t zns_read_bypass_check_frozen_deadline(
     return mismatches;
 }
 
+/*
+ * base_deadline 仍然冻结不变；deadline 字段作为当前保护线使用。
+ *
+ * 如果当前 request 通过 bypass 已经提前完成，那么它留在 per-plane queue 中
+ * 尚未开始执行的 entry 也应该收紧 deadline，避免后续 read 再把已经获得的
+ * host-level improvement 吃回去。
+ */
+static void zns_read_bypass_tighten_deadline(
+                                              uint64_t reqid,
+                                              struct zns_read_slack_sample *samples,
+                                              uint64_t sample_cnt,
+                                              uint64_t new_deadline,
+                                              uint64_t *tightened_entries,
+                                              uint64_t *tighten_failed_entries,
+                                              uint64_t *tightened_ns)
+{
+    uint64_t i;
+
+    if (tightened_entries) {
+        *tightened_entries = 0;
+    }
+    if (tighten_failed_entries) {
+        *tighten_failed_entries = 0;
+    }
+    if (tightened_ns) {
+        *tightened_ns = 0;
+    }
+
+    for (i = 0; i < sample_cnt; i++) {
+        struct zns_read_bypass_queue *queue =
+            zns_read_bypass_get_queue(&samples[i].ppa);
+        uint64_t pos;
+
+        if (!queue) {
+            continue;
+        }
+
+        for (pos = 0; pos < queue->len; pos++) {
+            struct zns_read_bypass_entry *entry = &queue->entries[pos];
+
+            if (entry->reqid != reqid || entry->subidx != i) {
+                continue;
+            }
+
+            if (entry->finish > new_deadline) {
+                if (tighten_failed_entries) {
+                    (*tighten_failed_entries)++;
+                }
+                break;
+            }
+
+            if (new_deadline < entry->deadline) {
+                if (tightened_entries) {
+                    (*tightened_entries)++;
+                }
+                if (tightened_ns) {
+                    *tightened_ns += entry->deadline - new_deadline;
+                }
+                entry->deadline = new_deadline;
+                entry->slack = new_deadline - entry->finish;
+            }
+            break;
+        }
+    }
+}
+
 //把一个 baseline read 子请求记录到队列，供后续 dry-run 使用。
 static void zns_read_bypass_remember_baseline_read(
     uint64_t reqid, uint64_t subidx, struct zns_read_slack_sample *sample,
@@ -1307,6 +1373,9 @@ static uint64_t zns_read(struct zns_ssd *zns, NvmeRequest *req)
         uint64_t pred_noncritical_reject_slack_insufficient = 0;
         uint64_t pred_critical_reject_after_noncritical = 0;
         uint64_t pred_critical_blocked_by_noncritical_slack = 0;
+        uint64_t deadline_tightened_entries = 0;
+        uint64_t deadline_tighten_failed_entries = 0;
+        uint64_t deadline_tightened_ns = 0;
         uint64_t unique_planes = 0; //这条读请求覆盖了多少个不同的 flash plane
         uint64_t critical_idx = 0;
         bool critical_found = false;
@@ -1433,6 +1502,14 @@ static uint64_t zns_read(struct zns_ssd *zns, NvmeRequest *req)
 
         sched_deadline = read_stime + maxlat;
 
+        if (exec_enabled && sched_deadline < base_deadline) {
+            zns_read_bypass_tighten_deadline(
+                reqid, samples, sample_cnt, sched_deadline,
+                &deadline_tightened_entries,
+                &deadline_tighten_failed_entries,
+                &deadline_tightened_ns);
+        }
+
         exec_host_improvement = (est_maxlat > maxlat) ?
             (est_maxlat - maxlat) : 0;
 
@@ -1469,7 +1546,10 @@ static uint64_t zns_read(struct zns_ssd *zns, NvmeRequest *req)
                     "total_hops=%lu,host_improved=%u,"
                     "host_improvement_ns=%lu,"
                     "pred_critical_executed_subops=%lu,"
-                    "pred_noncritical_executed_subops=%lu\n",
+                    "pred_noncritical_executed_subops=%lu,"
+                    "deadline_tightened_entries=%lu,"
+                    "deadline_tighten_failed_entries=%lu,"
+                    "deadline_tightened_ns=%lu\n",
                     reqid, lba, nlb, sample_cnt, unique_planes,
                     read_stime, maxlat, base_deadline, sched_deadline,
                     sched_deadline > base_deadline ? 1 : 0,
@@ -1488,7 +1568,10 @@ static uint64_t zns_read(struct zns_ssd *zns, NvmeRequest *req)
                     exec_host_improvement ? 1 : 0,
                     exec_host_improvement,
                     pred_critical_executed_subops,
-                    pred_noncritical_executed_subops);
+                    pred_noncritical_executed_subops,
+                    deadline_tightened_entries,
+                    deadline_tighten_failed_entries,
+                    deadline_tightened_ns);
         }
 
         if (exec_enabled && exec_candidate_subops) {
@@ -1512,7 +1595,10 @@ static uint64_t zns_read(struct zns_ssd *zns, NvmeRequest *req)
                     "pred_critical_reject_slack_insufficient=%lu,"
                     "pred_noncritical_reject_slack_insufficient=%lu,"
                     "pred_critical_reject_after_noncritical=%lu,"
-                    "pred_critical_blocked_by_noncritical_slack_ns=%lu\n",
+                    "pred_critical_blocked_by_noncritical_slack_ns=%lu,"
+                    "deadline_tightened_entries=%lu,"
+                    "deadline_tighten_failed_entries=%lu,"
+                    "deadline_tightened_ns=%lu\n",
                     reqid, sample_cnt, exec_candidate_subops,
                     exec_bypass_subops, exec_total_hops, exec_max_hops,
                     exec_total_benefit, exec_max_benefit,
@@ -1534,7 +1620,10 @@ static uint64_t zns_read(struct zns_ssd *zns, NvmeRequest *req)
                     pred_critical_reject_slack_insufficient,
                     pred_noncritical_reject_slack_insufficient,
                     pred_critical_reject_after_noncritical,
-                    pred_critical_blocked_by_noncritical_slack);
+                    pred_critical_blocked_by_noncritical_slack,
+                    deadline_tightened_entries,
+                    deadline_tighten_failed_entries,
+                    deadline_tightened_ns);
         }
 
         if (!exec_enabled) {
